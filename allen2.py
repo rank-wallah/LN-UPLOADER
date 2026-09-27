@@ -7,17 +7,26 @@ import shutil
 import asyncio
 import requests
 import subprocess
+import logging
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 # ==========================================
-# ENVIRONMENT CONFIGURATION & OWNER AUTH
+# LOGGING & ENVIRONMENT CONFIGURATION
 # ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-
 OWNER_ID = int(os.getenv("OWNER_ID", "6789039689"))
+
+if not TG_BOT_TOKEN:
+    logger.warning("TG_BOT_TOKEN is empty! Pyrogram will hang in CMD waiting for manual input.")
 
 AUTH_FILE = "authorized_users.json"
 SESSION_FILE = "allen_session.json"
@@ -29,7 +38,7 @@ def load_authorized_users():
             with open(AUTH_FILE, "r") as f:
                 return set(int(u) for u in json.load(f))
         except Exception as e:
-            print(f"[-] Error loading auth file: {e}")
+            logger.error(f"Error loading auth file: {e}")
     return {OWNER_ID}
 
 def save_authorized_users(users_set):
@@ -37,7 +46,7 @@ def save_authorized_users(users_set):
         with open(AUTH_FILE, "w") as f:
             json.dump(list(users_set), f)
     except Exception as e:
-        print(f"[-] Error saving auth file: {e}")
+        logger.error(f"Error saving auth file: {e}")
 
 AUTHORIZED_USERS = load_authorized_users()
 
@@ -52,7 +61,7 @@ def save_allen_session(data):
         with open(SESSION_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        print(f"[-] Error saving session: {e}")
+        logger.error(f"Error saving session: {e}")
 
 def get_allen_session():
     if os.path.exists(SESSION_FILE):
@@ -60,7 +69,7 @@ def get_allen_session():
             with open(SESSION_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"[-] Error reading session: {e}")
+            logger.error(f"Error reading session: {e}")
     return {}
 
 def get_allen_token():
@@ -81,12 +90,16 @@ MAX_TG_MSG_LEN = 4000
 ALLEN_BASE_URL = "https://app.allen.in/api/v1"
 
 def cleanup_workspace():
-    if os.path.exists(DOWNLOAD_DIR):
-        try:
-            shutil.rmtree(DOWNLOAD_DIR)
-        except Exception as e:
-            print(f"[-] Directory cleanup error: {e}")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    for item in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, item)
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+        except Exception as e:
+            logger.warning(f"Cleanup lock on {item} (ignoring): {e}")
 
 # ==========================================
 # ID * PASS RECON & AUTHENTICATION ENGINE
@@ -95,10 +108,9 @@ def cleanup_workspace():
 def allen_login_idpass(username, password):
     """Direct ID*PASS Authentication Flow"""
     login_endpoints = [
-        f"{ALLEN_BASE_URL}/user/login",
-        f"{ALLEN_BASE_URL}/auth/login",
+        "https://app.allen.in/api/v1/auth/login",
         "https://api.allen.in/v1/auth/login",
-        "https://user.allen.in/api/v1/login"
+        "https://api.allen.ac.in/v1/auth/login"
     ]
     
     payload = {
@@ -109,32 +121,39 @@ def allen_login_idpass(username, password):
     
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://app.allen.in",
         "Referer": "https://app.allen.in/"
     }
 
-    last_error = "No valid response from endpoints."
+    error_log = []
+    
     for endpoint in login_endpoints:
+        logger.info(f"Attempting auth via {endpoint}...")
         try:
-            res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
+            res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
             if res.status_code == 200:
                 data = res.json()
                 token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
                 if token:
                     save_allen_session({"username": username, "token": token, "login_time": time.time()})
+                    logger.info(f"Auth successful on {endpoint}")
                     return token
             else:
-                last_error = f"HTTP {res.status_code} on {endpoint}: {res.text[:100]}"
+                # Capture the actual API rejection reason
+                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] HTTP {res.status_code}: {res.text[:60]}"
+                error_log.append(err_msg)
+                logger.warning(err_msg)
         except Exception as e:
-            last_error = f"Request failed on {endpoint}: {str(e)}"
-            continue
+            err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Request failed"
+            error_log.append(err_msg)
+            logger.warning(f"{err_msg}: {str(e)}")
 
-    raise ValueError(f"Login failed across all endpoints. Last Error: {last_error}")
+    combined_errors = "\n".join(error_log)
+    raise ValueError(f"Login failed across all endpoints:\n{combined_errors}")
 
 def fetch_batch_contents(batch_id, token):
-    """Fetches full hierarchy & content list for given Batch ID"""
     url = f"{ALLEN_BASE_URL}/batch/{batch_id}/contents"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -213,7 +232,7 @@ async def async_upload_to_telegram(app_client, target_chat_id, file_path, captio
 
 @app.on_message(filters.command("auth") & filters.private)
 async def handle_auth(client: Client, message: Message):
-    """Owner command to manage authorized users"""
+    logger.info(f"/auth triggered by {message.from_user.id}")
     if message.from_user.id != OWNER_ID:
         await message.reply_text("<blockquote><i>🚫 Owner-only command.</i></blockquote>")
         return
@@ -239,8 +258,11 @@ async def handle_auth(client: Client, message: Message):
 
 @app.on_message(filters.command("login") & (filters.group | filters.channel | filters.private))
 async def handle_login(client: Client, message: Message):
-    """Usage: /login id*pass"""
+    user_id = message.from_user.id if message.from_user else "Unknown"
+    logger.info(f"/login triggered by {user_id}")
+    
     if message.from_user and not is_user_authorized(message.from_user.id):
+        logger.warning(f"Unauthorized access attempt by {user_id}")
         await message.reply_text("<blockquote><i>🚫 Access Denied. Contact Admin.</i></blockquote>")
         return
 
@@ -256,10 +278,12 @@ async def handle_login(client: Client, message: Message):
         token = await asyncio.to_thread(allen_login_idpass, username, password)
         await status_msg.edit_text("<blockquote><i>🎉 <b>Login Successful! Session Saved.</b>\n\nNow run: <code>/batch &lt;BATCH_ID&gt;</code></i></blockquote>")
     except Exception as e:
-        await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b> <code>{str(e)}</code></i></blockquote>")
+        logger.error(f"Login pipeline failed: {e}")
+        await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
+    logger.info(f"/batch triggered by {message.from_user.id if message.from_user else 'Unknown'}")
     if message.from_user and not is_user_authorized(message.from_user.id):
         await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
         return
@@ -309,6 +333,7 @@ async def handle_batch(client: Client, message: Message):
         await message.reply_text("<blockquote><i>✅ <b>Batch Execution Finished Completely!</b></i></blockquote>")
 
     except Exception as e:
+        logger.error(f"Batch execution failed: {e}")
         await message.reply_text(f"<blockquote><i>❌ <b>Batch Error:</b> <code>{str(e)}</code></i></blockquote>")
     finally:
         ACTIVE_JOBS[target_chat_id] = {"running": False}
@@ -327,8 +352,9 @@ async def show_id(client: Client, message: Message):
     await message.reply_text(f"<blockquote><i>🆔 Chat ID: <code>{message.chat.id}</code></i></blockquote>")
 
 def main():
+    logger.info("Initializing workspace cleanup...")
     cleanup_workspace()
-    print("[+] Full 380+ Line Structure Restored with ID*PASS Auto-Auth Engine...")
+    logger.info("Workspace clean. Booting Pyrogram engine...")
     app.run()
 
 if __name__ == "__main__":
