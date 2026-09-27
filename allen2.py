@@ -87,7 +87,7 @@ app = Client(
 
 ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000
-ALLEN_BASE_URL = "https://app.allen.in/api/v1"
+ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
 
 def cleanup_workspace():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -108,7 +108,7 @@ def cleanup_workspace():
 def allen_login_idpass(username, password):
     """Direct ID*PASS Authentication Flow"""
     login_endpoints = [
-        "https://app.allen.in/api/v1/auth/login",
+        "https://api.allen-live.in/api/v1/auth/username",
         "https://api.allen.in/v1/auth/login",
         "https://api.allen.ac.in/v1/auth/login"
     ]
@@ -123,8 +123,8 @@ def allen_login_idpass(username, password):
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Origin": "https://app.allen.in",
-        "Referer": "https://app.allen.in/"
+        "Origin": "https://api.allen.in",
+        "Referer": "https://api.allen.in/"
     }
 
     error_log = []
