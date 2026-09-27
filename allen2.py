@@ -105,17 +105,18 @@ def cleanup_workspace():
 # ==========================================
 # ID * PASS RECON & AUTHENTICATION ENGINE
 # ==========================================
+
 def allen_login_idpass(username, password):
-    """Direct ID*PASS Authentication Flow"""
+    """Direct ID*PASS Authentication Flow with multiple DeviceID strategies and debugging."""
     login_endpoints = [
         "https://api.allen-live.in/api/v1/auth/username",
         "https://api.allen.in/v1/auth/login",
         "https://api.allen.ac.in/v1/auth/login"
     ]
 
-    # dynamic device ID for API compatibility
     device_id = str(uuid.uuid4())
 
+    # Payload variants (include multiple key spellings)
     payload = {
         "username": username,
         "password": password,
@@ -125,37 +126,105 @@ def allen_login_idpass(username, password):
         "device_id": device_id
     }
 
-    headers = {
+    # Header base + multiple DeviceID forms (HTTP header names are case-insensitive but some servers check specific keys)
+    base_headers = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/",
-        "DeviceID": device_id,
-        "device-id": device_id
+        "Referer": "https://api.allen.in/"
     }
+    device_header_variants = [
+        ("DeviceID", device_id),
+        ("device-id", device_id),
+        ("deviceId", device_id),
+        ("deviceid", device_id),
+        ("X-Device-Id", device_id),
+        ("x-device-id", device_id),
+        ("X-DeviceID", device_id),
+    ]
 
     error_log = []
 
     for endpoint in login_endpoints:
-        logger.info(f"Attempting auth via {endpoint}...")
+        logger.info(f"Attempting auth via {endpoint} (device_id={device_id})...")
+        # 1) Try JSON + common device headers (add a few variants)
+        headers = base_headers.copy()
+        # attach a couple of common variants simultaneously
+        for k, v in device_header_variants[:3]:
+            headers[k] = v
         try:
             res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+            # Log what we sent (debug)
+            try:
+                logger.debug(f"Request to {endpoint} headers: {res.request.headers}")
+                body = res.request.body
+n                try:
+                    logger.debug(f"Request body: {body.decode() if isinstance(body, bytes) else body}")
+                except Exception:
+                    logger.debug("Request body could not be decoded for logging.")
+            except Exception:
+                logger.debug("Could not log request details")
+
             if res.status_code == 200:
                 data = res.json()
                 token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
                 if token:
                     save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                    logger.info(f"Auth successful on {endpoint}")
+                    logger.info(f"Auth successful on {endpoint} (json + headers)")
                     return token
             else:
-                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] HTTP {res.status_code}: {res.text[:60]}"
+                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] HTTP {res.status_code}: {res.text[:200]}"
                 error_log.append(err_msg)
                 logger.warning(err_msg)
+
+            # 2) If server returned 400 DeviceID empty, try form-encoded
+            if res.status_code == 400 and "DeviceID" in (res.text or ""):
+                headers2 = base_headers.copy()
+                headers2["Content-Type"] = "application/x-www-form-urlencoded"
+                for k, v in device_header_variants[:4]:
+                    headers2[k] = v
+                res2 = requests.post(endpoint, data=payload, headers=headers2, timeout=15)
+                try:
+                    logger.debug(f"Form request to {endpoint} headers: {res2.request.headers}")
+                    logger.debug(f"Form request body: {res2.request.body}")
+                except Exception:
+                    logger.debug("Form request body could not be decoded for logging.")
+                if res2.status_code == 200:
+                    data = res2.json()
+                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
+                    if token:
+                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
+                        logger.info(f"Auth successful on {endpoint} (form + headers)")
+                        return token
+                else:
+                    err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Form HTTP {res2.status_code}: {res2.text[:200]}"
+                    error_log.append(err_msg)
+                    logger.warning(err_msg)
+
+            # 3) If still failing, try passing device id as a query param
+            params = {"device_id": device_id}
+            res3 = requests.post(endpoint, json=payload, headers=base_headers, params=params, timeout=15)
+            try:
+                logger.debug(f"Query-param request to {endpoint} url: {res3.url}")
+            except Exception:
+                pass
+            if res3.status_code == 200:
+                data = res3.json()
+                token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
+                if token:
+                    save_allen_session({"username": username, "token": token, "login_time": time.time()})
+                    logger.info(f"Auth successful on {endpoint} (json + params)")
+                    return token
+            else:
+                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Params HTTP {res3.status_code}: {res3.text[:200]}"
+                error_log.append(err_msg)
+                logger.warning(err_msg)
+
         except Exception as e:
-            err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Request failed"
+            err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Request failed: {e}"
             error_log.append(err_msg)
-            logger.warning(f"{err_msg}: {str(e)}")
+            logger.warning(err_msg)
 
     combined_errors = "\n".join(error_log)
     raise ValueError(f"Login failed across all endpoints:\n{combined_errors}")
@@ -167,20 +236,20 @@ def fetch_batch_contents(batch_id, token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-
+    
     res = requests.get(url, headers=headers, timeout=25)
     res.raise_for_status()
     data = res.json()
-
+    
     data_items = []
     raw_list = data if isinstance(data, list) else data.get("data", data.get("items", []))
-
+    
     for item in raw_list:
         title = item.get("title") or item.get("topic_name") or item.get("name") or "Lecture"
         m3u8_url = item.get("url") or item.get("m3u8_url") or item.get("stream_url") or item.get("video_url")
         pdf_url = item.get("pdf_url") or item.get("document_url")
         is_new_chapter = item.get("is_new_chapter", False)
-
+        
         if m3u8_url or pdf_url:
             data_items.append({
                 "title": title,
@@ -188,12 +257,13 @@ def fetch_batch_contents(batch_id, token):
                 "pdf": pdf_url,
                 "is_new_chapter": is_new_chapter
             })
-
+            
     return data_items
 
 # ==========================================
 # HIGH SPEED DOWNLOAD & UPLOAD ENGINE
 # ==========================================
+
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     cmd = [
@@ -211,7 +281,7 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
 
     subprocess.run(cmd, check=True)
     output_path = os.path.join(DOWNLOAD_DIR, f"{output_name}.mp4")
-
+    
     if not os.path.exists(output_path):
         for file in os.listdir(DOWNLOAD_DIR):
             if file.startswith(output_name):
@@ -329,9 +399,9 @@ async def handle_batch(client: Client, message: Message):
             if item.get("url"):
                 video_path = await async_download_m3u8(item["url"], clean_title, token)
                 caption = f"<blockquote><i><b>{title}</b>\n\nAllen High-Speed Auto-Downloader</i></blockquote>"
-
+                
                 await async_upload_to_telegram(app, target_chat_id, video_path, caption)
-
+                
                 if os.path.exists(video_path):
                     os.remove(video_path)
                 gc.collect()
