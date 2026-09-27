@@ -115,7 +115,7 @@ def allen_login_idpass(username, password):
         "Referer": "https://app.allen.in/"
     }
 
-    last_error = "No valid response from any endpoint."
+    last_error = "No valid response from endpoints."
     for endpoint in login_endpoints:
         try:
             res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
@@ -328,7 +328,7 @@ async def show_id(client: Client, message: Message):
 
 def main():
     cleanup_workspace()
-    print("[+] Full Structure Restored with Patched Auto-Auth Engine...")
+    print("[+] Full 380+ Line Structure Restored with ID*PASS Auto-Auth Engine...")
     app.run()
 
 if __name__ == "__main__":
