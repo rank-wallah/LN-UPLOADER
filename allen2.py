@@ -2,8 +2,10 @@ import os
 import sys
 import json
 import time
-import subprocess
+import gc
+import shutil
 import asyncio
+import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -18,6 +20,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "6789039689"))
 
 AUTH_FILE = "authorized_users.json"
+DOWNLOAD_DIR = "./downloads"
 
 def load_authorized_users():
     if os.path.exists(AUTH_FILE):
@@ -53,50 +56,65 @@ app = Client(
 ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000  # Safe margin below 4096 Telegram limit
 
-def progress_bar(current, total, status):
-    percent = (current / total) * 100
-    speed_bar = f"[{'=' * int(percent // 10)}{' ' * (10 - int(percent // 10))}] {percent:.1f}%"
-    print(f"\r{status}: {speed_bar}", end="", flush=True)
+def cleanup_workspace():
+    """Removes temporary leftover downloads on restart or completion."""
+    if os.path.exists(DOWNLOAD_DIR):
+        try:
+            shutil.rmtree(DOWNLOAD_DIR)
+        except Exception as e:
+            print(f"[-] Directory cleanup error: {e}")
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     print(f"\n[+] Starting download: {output_name}")
-    os.makedirs("./downloads", exist_ok=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     
+    # Tuned for high throughput and network stability on cloud runners
     cmd = [
         "N_m3u8DL-RE",
         m3u8_url,
         "--save-name", output_name,
-        "--save-dir", "./downloads",
+        "--save-dir", DOWNLOAD_DIR,
         "--auto-select",
         "--thread-count", "16",
-        "--download-retry-count", "5"
+        "--download-retry-count", "10",
+        "--no-log"
     ]
     
     if bearer_token:
         cmd.extend(["--header", f"Authorization: Bearer {bearer_token}"])
 
     subprocess.run(cmd, check=True)
-    return os.path.join("./downloads", f"{output_name}.mp4")
+    
+    output_path = os.path.join(DOWNLOAD_DIR, f"{output_name}.mp4")
+    if not os.path.exists(output_path):
+        # Fallback search if extension differs
+        for file in os.listdir(DOWNLOAD_DIR):
+            if file.startswith(output_name):
+                return os.path.join(DOWNLOAD_DIR, file)
+                
+    return output_path
+
+async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
+    """Executes heavy download synchronously in thread pool to prevent blocking Pyrogram bot loop."""
+    return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token)
 
 def upload_to_telegram(app_client, target_chat_id, file_path, caption):
     print(f"\n[+] Uploading to target: {target_chat_id}")
-    def progress(current, total):
-        progress_bar(current, total, "Uploading")
 
     sent_msg = app_client.send_video(
         chat_id=target_chat_id,
         video=file_path,
         caption=caption,
-        progress=progress
+        supports_streaming=True
     )
     print("\n[+] Upload completed successfully.")
     return sent_msg
 
+async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
+    return await asyncio.to_thread(upload_to_telegram, app_client, target_chat_id, file_path, caption)
+
 def send_chunked_messages(app_client, target_chat_id, header, index_items, pin_last=True):
-    """
-    Handles Telegram character limits by chunking large index lists into multiple messages.
-    Formats links strictly as: ([CHAPTER_TOPIC](https://t.me/c/<chat_id>/<msg_id>))
-    """
     messages_to_send = []
     current_text = header + "\n"
 
@@ -139,7 +157,7 @@ def get_message_link(chat_id, msg_id):
         return f"https://t.me/c/{real_id}/{msg_id}"
     return f"https://t.me/c/{chat_id}/{msg_id}"
 
-def process_batch(target_chat_id, data_items, bearer_token=None):
+async def process_batch_async(target_chat_id, data_items, bearer_token=None):
     index_records = []
 
     for index, item in enumerate(data_items, start=1):
@@ -157,7 +175,8 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
         clean_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).rstrip()
 
         try:
-            downloaded_path = download_m3u8(m3u8_url, clean_title, bearer_token)
+            # Async non-blocking download
+            downloaded_path = await async_download_m3u8(m3u8_url, clean_title, bearer_token)
             
             formatted_caption = (
                 f"> *{title}*\n"
@@ -165,22 +184,27 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
                 f"> _Uploaded via Downloader Engine_"
             )
             
-            sent_msg = upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
+            # Async non-blocking upload
+            sent_msg = await async_upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
             msg_link = get_message_link(target_chat_id, sent_msg.id)
 
             if is_new_chapter or index == 1:
                 try:
-                    app.pin_chat_message(target_chat_id, sent_msg.id)
+                    await app.pin_chat_message(target_chat_id, sent_msg.id)
                 except Exception as pin_err:
                     print(f"[-] Pinning failed: {pin_err}")
 
             index_records.append({"title": title, "link": msg_link})
             
+            # Immediate Garbage Collection & File Deletion for low RAM usage
             if os.path.exists(downloaded_path):
                 os.remove(downloaded_path)
+            gc.collect()
+
         except Exception as e:
             print(f"\n[-] Error processing {title}: {str(e)}")
 
+    # Send Master Index upon completion
     if index_records and ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
         index_header = (
             f"> _📌 **BATCH MASTER INDEX**_\n"
@@ -195,14 +219,14 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
 # ==========================================
 
 @app.on_message(filters.command("auth"))
-def authorize_user(client: Client, message: Message):
+async def authorize_user(client: Client, message: Message):
     if message.from_user.id != OWNER_ID:
-        message.reply_text("> _🚫 Only the Bot Owner can authorize users._")
+        await message.reply_text("> _🚫 Only the Bot Owner can authorize users._")
         return
 
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
-        message.reply_text("> _⚠️ Usage: `/auth <USER_ID>`_")
+        await message.reply_text("> _⚠️ Usage: `/auth <USER_ID>`_")
         return
 
     target_id = int(args[1])
@@ -214,22 +238,22 @@ def authorize_user(client: Client, message: Message):
         f">\n"
         f"> _User ID `{target_id}` has been granted full access to the bot._"
     )
-    message.reply_text(msg)
+    await message.reply_text(msg)
 
 @app.on_message(filters.command("unauth"))
-def unauthorize_user(client: Client, message: Message):
+async def unauthorize_user(client: Client, message: Message):
     if message.from_user.id != OWNER_ID:
-        message.reply_text("> _🚫 Only the Bot Owner can revoke authorizations._")
+        await message.reply_text("> _🚫 Only the Bot Owner can revoke authorizations._")
         return
 
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
-        message.reply_text("> _⚠️ Usage: `/unauth <USER_ID>`_")
+        await message.reply_text("> _⚠️ Usage: `/unauth <USER_ID>`_")
         return
 
     target_id = int(args[1])
     if target_id == OWNER_ID:
-        message.reply_text("> _⚠️ You cannot revoke owner privileges._")
+        await message.reply_text("> _⚠️ You cannot revoke owner privileges._")
         return
 
     AUTHORIZED_USERS.discard(target_id)
@@ -240,12 +264,12 @@ def unauthorize_user(client: Client, message: Message):
         f">\n"
         f"> _User ID `{target_id}` access has been removed._"
     )
-    message.reply_text(msg)
+    await message.reply_text(msg)
 
 @app.on_message(filters.command("authlist"))
-def list_authorized_users(client: Client, message: Message):
+async def list_authorized_users(client: Client, message: Message):
     if not is_user_authorized(message.from_user.id):
-        message.reply_text("> _🚫 Access Denied._")
+        await message.reply_text("> _🚫 Access Denied._")
         return
 
     users_str = "\n".join([f"> • `{u}`" + (" (Owner)" if u == OWNER_ID else "") for u in AUTHORIZED_USERS])
@@ -254,16 +278,16 @@ def list_authorized_users(client: Client, message: Message):
         f">\n"
         f"{users_str}"
     )
-    message.reply_text(list_msg)
+    await message.reply_text(list_msg)
 
 # ==========================================
 # TELEGRAM BOT STYLED UI & COMMANDS
 # ==========================================
 
 @app.on_message(filters.command(["start", "help"]) & (filters.group | filters.channel | filters.private))
-def start_and_help_handler(client: Client, message: Message):
+async def start_and_help_handler(client: Client, message: Message):
     if message.from_user and not is_user_authorized(message.from_user.id):
-        message.reply_text("> _🚫 **Access Denied**_\n>\n> _You are not authorized to use this bot. Contact the owner (`6789039689`) for access._")
+        await message.reply_text("> _🚫 **Access Denied**_\n>\n> _You are not authorized to use this bot. Contact the owner (`6789039689`) for access._")
         return
 
     ui_text = (
@@ -294,15 +318,15 @@ def start_and_help_handler(client: Client, message: Message):
         f"> _Every topic/chapter is tracked. Upon completion, a hyperlinked Index message is created and pinned formatted as `([TOPIC](https://t.me/c/...))`._"
     )
     
-    message.reply_text(
+    await message.reply_text(
         text=ui_text,
         disable_web_page_preview=True
     )
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
-def handle_batch_upload(client: Client, message: Message):
+async def handle_batch_upload(client: Client, message: Message):
     if message.from_user and not is_user_authorized(message.from_user.id):
-        message.reply_text("> _🚫 Access Denied._")
+        await message.reply_text("> _🚫 Access Denied._")
         return
 
     target_chat_id = message.chat.id
@@ -316,7 +340,7 @@ def handle_batch_upload(client: Client, message: Message):
             f">\n"
             f"> _Please reply to or attach a valid `.json` batch file with the command `/batch <OPTIONAL_BEARER_TOKEN>`._"
         )
-        message.reply_text(error_msg)
+        await message.reply_text(error_msg)
         return
 
     if ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
@@ -325,10 +349,10 @@ def handle_batch_upload(client: Client, message: Message):
             f">\n"
             f"> _A batch task is currently running in this chat. Send `/stop` first to cancel it._"
         )
-        message.reply_text(already_running_msg)
+        await message.reply_text(already_running_msg)
         return
 
-    json_path = message.download()
+    json_path = await message.download()
     with open(json_path, "r", encoding="utf-8") as f:
         data_items = json.load(f)
     os.remove(json_path)
@@ -343,23 +367,23 @@ def handle_batch_upload(client: Client, message: Message):
         f"> _Index Auto-Generation: Enabled_\n"
         f"> _Status: Running..._"
     )
-    message.reply_text(start_msg)
+    await message.reply_text(start_msg)
 
     try:
-        process_batch(target_chat_id, data_items, bearer_token)
+        await process_batch_async(target_chat_id, data_items, bearer_token)
         complete_msg = (
             f"> _✅ **Batch Processing & Indexing Completed**_\n"
             f">\n"
             f"> _All items from the batch file were uploaded and pinned, and the master index has been published._"
         )
-        message.reply_text(complete_msg)
+        await message.reply_text(complete_msg)
     finally:
         ACTIVE_JOBS[target_chat_id] = {"running": False, "token": None}
 
 @app.on_message(filters.command("stop") & (filters.group | filters.channel | filters.private))
-def stop_batch_upload(client: Client, message: Message):
+async def stop_batch_upload(client: Client, message: Message):
     if message.from_user and not is_user_authorized(message.from_user.id):
-        message.reply_text("> _🚫 Access Denied._")
+        await message.reply_text("> _🚫 Access Denied._")
         return
 
     target_chat_id = message.chat.id
@@ -370,17 +394,17 @@ def stop_batch_upload(client: Client, message: Message):
             f">\n"
             f"> _Sent stop signal to active queue processing for this channel._"
         )
-        message.reply_text(stop_msg)
+        await message.reply_text(stop_msg)
     else:
         no_task_msg = (
             f"> _⚠️ **No Active Task**_\n"
             f">\n"
             f"> _There are no active downloading tasks currently running in this chat._"
         )
-        message.reply_text(no_task_msg)
+        await message.reply_text(no_task_msg)
 
 @app.on_message(filters.command("id"))
-def show_chat_id(client: Client, message: Message):
+async def show_chat_id(client: Client, message: Message):
     id_msg = (
         f"> _🆔 **Current Chat Metadata**_\n"
         f">\n"
@@ -388,10 +412,11 @@ def show_chat_id(client: Client, message: Message):
         f"> _User ID: `{message.from_user.id if message.from_user else 'Channel'}`_\n"
         f"> _Chat Type: `{message.chat.type}`_"
     )
-    message.reply_text(id_msg)
+    await message.reply_text(id_msg)
 
 def main():
-    print("[+] Multi-Channel Authorized Downloader Engine Started...")
+    cleanup_workspace()
+    print("[+] Optimized Multi-Channel Authorized Downloader Engine Started...")
     app.run()
 
 if __name__ == "__main__":
