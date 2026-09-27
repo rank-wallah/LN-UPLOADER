@@ -9,6 +9,7 @@ import requests
 import subprocess
 import logging
 import uuid
+import socket
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
@@ -33,7 +34,6 @@ AUTH_FILE = "authorized_users.json"
 SESSION_FILE = "allen_session.json"
 DOWNLOAD_DIR = "./downloads"
 
-
 def load_authorized_users():
     if os.path.exists(AUTH_FILE):
         try:
@@ -43,7 +43,6 @@ def load_authorized_users():
             logger.error(f"Error loading auth file: {e}")
     return {OWNER_ID}
 
-
 def save_authorized_users(users_set):
     try:
         with open(AUTH_FILE, "w") as f:
@@ -51,13 +50,10 @@ def save_authorized_users(users_set):
     except Exception as e:
         logger.error(f"Error saving auth file: {e}")
 
-
 AUTHORIZED_USERS = load_authorized_users()
-
 
 def is_user_authorized(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id in AUTHORIZED_USERS
-
 
 # ==========================================
 # SESSION MANAGEMENT (TOKEN & CREDS)
@@ -69,7 +65,6 @@ def save_allen_session(data):
     except Exception as e:
         logger.error(f"Error saving session: {e}")
 
-
 def get_allen_session():
     if os.path.exists(SESSION_FILE):
         try:
@@ -79,11 +74,9 @@ def get_allen_session():
             logger.error(f"Error reading session: {e}")
     return {}
 
-
 def get_allen_token():
     session = get_allen_session()
     return session.get("access_token") or session.get("token")
-
 
 app = Client(
     "allen_downloader_bot",
@@ -98,7 +91,6 @@ ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000
 ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
 
-
 def cleanup_workspace():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     for item in os.listdir(DOWNLOAD_DIR):
@@ -111,28 +103,28 @@ def cleanup_workspace():
         except Exception as e:
             logger.warning(f"Cleanup lock on {item} (ignoring): {e}")
 
-
-def validate_runtime_config():
-    missing = []
-    if not TG_API_ID or TG_API_ID == 0:
-        missing.append("TG_API_ID")
-    if not TG_API_HASH:
-        missing.append("TG_API_HASH")
-    if not TG_BOT_TOKEN:
-        missing.append("TG_BOT_TOKEN")
-    if missing:
-        raise SystemExit(
-            "Missing required env vars: " + ", ".join(missing) + ". "
-            "Set them before running the bot."
-        )
-
-
 # ==========================================
 # ID * PASS RECON & AUTHENTICATION ENGINE
 # ==========================================
 
+def _host_resolves(url):
+    try:
+        host = url.split('//', 1)[1].split('/')[0]
+        socket.getaddrinfo(host, None)
+        return True
+    except Exception:
+        return False
+
+
 def allen_login_idpass(username, password):
-    """Direct ID*PASS Authentication Flow with DeviceID support and fallback strategies."""
+    """Attempt multiple payload/header permutations to satisfy Allen API DeviceID requirement.
+
+    Strategy:
+    - Skip endpoints that fail DNS resolution quickly.
+    - Try multiple username key spellings and device id key/header spellings.
+    - Try JSON, form-encoded, and query-param modes.
+    - Log request/response details for debugging.
+    """
     login_endpoints = [
         "https://api.allen-live.in/api/v1/auth/username",
         "https://api.allen.in/v1/auth/login",
@@ -141,97 +133,126 @@ def allen_login_idpass(username, password):
 
     device_id = str(uuid.uuid4())
 
-    payload = {
-        "username": username,
-        "password": password,
-        "grant_type": "password",
-        "DeviceID": device_id,
-        "deviceId": device_id,
-        "device_id": device_id,
-    }
+    username_keys = ["username", "userName", "user_name", "user"]
+    device_body_keys = ["DeviceID", "deviceId", "device_id", "deviceid"]
+    device_header_keys = ["DeviceID", "device-id", "deviceId", "deviceid", "X-Device-Id", "x-device-id"]
 
     base_headers = {
-        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/",
-        "DeviceID": device_id,
-        "device-id": device_id,
-        "deviceId": device_id,
+        "Referer": "https://api.allen.in/"
     }
 
     error_log = []
 
     for endpoint in login_endpoints:
-        logger.info(f"Attempting auth via {endpoint} (device_id={device_id})...")
+        if not _host_resolves(endpoint):
+            logger.warning(f"Skipping {endpoint} — DNS lookup failed")
+            error_log.append(f"[{endpoint.split('//')[1].split('/')[0]}] DNS lookup failed")
+            continue
 
-        for mode in ["json", "form", "params"]:
-            try:
-                if mode == "json":
-                    headers = base_headers.copy()
+        logger.info(f"Trying endpoint {endpoint} (device_id={device_id})")
+
+        # build base payload entries (we will vary keys)
+        for uname_key in username_keys:
+            for dev_key in device_body_keys:
+                payload = {uname_key: username, "password": password, "grant_type": "password", dev_key: device_id}
+
+                # Try JSON mode
+                headers = {**base_headers, "Content-Type": "application/json"}
+                # include some device headers too
+                for hk in device_header_keys[:2]:
+                    headers[hk] = device_id
+
+                try:
                     res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
-                elif mode == "form":
-                    headers = {**base_headers, "Content-Type": "application/x-www-form-urlencoded"}
-                    res = requests.post(endpoint, data=payload, headers=headers, timeout=15)
-                else:
-                    headers = {k: v for k, v in base_headers.items() if k.lower() != "content-type"}
-                    res = requests.post(endpoint, json=payload, headers=headers, params={"device_id": device_id}, timeout=15)
+                    logger.debug(f"POST JSON -> {endpoint} sent headers: {headers}")
+                    logger.debug(f"POST JSON -> body: {json.dumps(payload)}")
+                except Exception as e:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] JSON request failed: {e}"
+                    error_log.append(err)
+                    logger.warning(err)
+                    res = None
 
-                if res.status_code == 200:
-                    data = res.json()
+                if res is not None and res.status_code == 200:
+                    try:
+                        data = res.json()
+                    except Exception:
+                        data = {}
                     token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
                     if token:
                         save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                        logger.info(f"Auth successful on {endpoint} using {mode}")
+                        logger.info(f"Auth successful on {endpoint} (json, keys: {uname_key}/{dev_key})")
                         return token
                     else:
-                        logger.warning(f"Auth endpoint {endpoint} returned 200 but no token: {data}")
-                else:
-                    err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] {mode.upper()} HTTP {res.status_code}: {res.text[:200]}"
-                    error_log.append(err_msg)
-                    logger.warning(err_msg)
+                        logger.debug(f"200 but no token in response: {res.text}")
 
-            except Exception as e:
-                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] {mode.upper()} request failed: {str(e)}"
-                error_log.append(err_msg)
-                logger.warning(err_msg)
+                if res is not None:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] JSON HTTP {res.status_code}: {res.text[:300]}"
+                    error_log.append(err)
+
+                # Try form-encoded mode
+                headers2 = {**base_headers, "Content-Type": "application/x-www-form-urlencoded"}
+                for hk in device_header_keys[:3]:
+                    headers2[hk] = device_id
+                try:
+                    res2 = requests.post(endpoint, data=payload, headers=headers2, timeout=15)
+                    logger.debug(f"POST FORM -> {endpoint} sent headers: {headers2}")
+                    logger.debug(f"POST FORM -> body: {payload}")
+                except Exception as e:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] FORM request failed: {e}"
+                    error_log.append(err)
+                    logger.warning(err)
+                    res2 = None
+
+                if res2 is not None and res2.status_code == 200:
+                    try:
+                        data = res2.json()
+                    except Exception:
+                        data = {}
+                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
+                    if token:
+                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
+                        logger.info(f"Auth successful on {endpoint} (form, keys: {uname_key}/{dev_key})")
+                        return token
+                    else:
+                        logger.debug(f"200 but no token in form response: {res2.text}")
+
+                if res2 is not None:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] FORM HTTP {res2.status_code}: {res2.text[:300]}"
+                    error_log.append(err)
+
+                # Try params mode (device in query)
+                headers3 = {k: v for k, v in base_headers.items()}
+                try:
+                    res3 = requests.post(endpoint, json={"username": username, "password": password}, headers=headers3, params={"device_id": device_id}, timeout=15)
+                    logger.debug(f"POST PARAMS -> {endpoint} url: {res3.url}")
+                except Exception as e:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] PARAMS request failed: {e}"
+                    error_log.append(err)
+                    logger.warning(err)
+                    res3 = None
+
+                if res3 is not None and res3.status_code == 200:
+                    try:
+                        data = res3.json()
+                    except Exception:
+                        data = {}
+                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
+                    if token:
+                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
+                        logger.info(f"Auth successful on {endpoint} (params, keys: {uname_key}/{dev_key})")
+                        return token
+                    else:
+                        logger.debug(f"200 but no token in params response: {res3.text}")
+
+                if res3 is not None:
+                    err = f"[{endpoint.split('//')[1].split('/')[0]}] PARAMS HTTP {res3.status_code}: {res3.text[:300]}"
+                    error_log.append(err)
 
     combined_errors = "\n".join(error_log)
     raise ValueError(f"Login failed across all endpoints:\n{combined_errors}")
-
-
-def fetch_batch_contents(batch_id, token):
-    url = f"{ALLEN_BASE_URL}/batch/{batch_id}/contents"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/json"
-    }
-
-    res = requests.get(url, headers=headers, timeout=25)
-    res.raise_for_status()
-    data = res.json()
-
-    data_items = []
-    raw_list = data if isinstance(data, list) else data.get("data", data.get("items", []))
-
-    for item in raw_list:
-        title = item.get("title") or item.get("topic_name") or item.get("name") or "Lecture"
-        m3u8_url = item.get("url") or item.get("m3u8_url") or item.get("stream_url") or item.get("video_url")
-        pdf_url = item.get("pdf_url") or item.get("document_url")
-        is_new_chapter = item.get("is_new_chapter", False)
-
-        if m3u8_url or pdf_url:
-            data_items.append({
-                "title": title,
-                "url": m3u8_url,
-                "pdf": pdf_url,
-                "is_new_chapter": is_new_chapter
-            })
-
-    return data_items
-
 
 # ==========================================
 # HIGH SPEED DOWNLOAD & UPLOAD ENGINE
@@ -261,10 +282,8 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
                 return os.path.join(DOWNLOAD_DIR, file)
     return output_path
 
-
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token)
-
 
 def upload_to_telegram(app_client, target_chat_id, file_path, caption):
     return app_client.send_video(
@@ -274,10 +293,8 @@ def upload_to_telegram(app_client, target_chat_id, file_path, caption):
         supports_streaming=True
     )
 
-
 async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
     return await asyncio.to_thread(upload_to_telegram, app_client, target_chat_id, file_path, caption)
-
 
 # ==========================================
 # TELEGRAM BOT COMMAND HANDLERS
@@ -309,7 +326,6 @@ async def handle_auth(client: Client, message: Message):
     except ValueError:
         await message.reply_text("<blockquote><i>⚠️ Invalid User ID.</i></blockquote>")
 
-
 @app.on_message(filters.command("login") & (filters.group | filters.channel | filters.private))
 async def handle_login(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else "Unknown"
@@ -337,7 +353,6 @@ async def handle_login(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
-
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
@@ -396,7 +411,6 @@ async def handle_batch(client: Client, message: Message):
     finally:
         ACTIVE_JOBS[target_chat_id] = {"running": False}
 
-
 @app.on_message(filters.command("stop"))
 async def handle_stop(client: Client, message: Message):
     chat_id = message.chat.id
@@ -406,24 +420,28 @@ async def handle_stop(client: Client, message: Message):
     else:
         await message.reply_text("<blockquote><i>⚠️ No active task running in this chat.</i></blockquote>")
 
-
 @app.on_message(filters.command("id"))
 async def show_id(client: Client, message: Message):
     await message.reply_text(f"<blockquote><i>🆔 Chat ID: <code>{message.chat.id}</code></i></blockquote>")
 
 
 def main():
-    try:
-        validate_runtime_config()
-    except SystemExit as e:
-        print(str(e))
-        raise
+    # validate runtime environment and fail fast if missing
+    missing = []
+    if not TG_API_ID or TG_API_ID == 0:
+        missing.append("TG_API_ID")
+    if not TG_API_HASH:
+        missing.append("TG_API_HASH")
+    if not TG_BOT_TOKEN:
+        missing.append("TG_BOT_TOKEN")
+    if missing:
+        logger.error("Missing required env vars: %s", ", ".join(missing))
+        sys.exit(1)
 
     logger.info("Initializing workspace cleanup...")
     cleanup_workspace()
     logger.info("Workspace clean. Booting Pyrogram engine...")
     app.run()
-
 
 if __name__ == "__main__":
     main()
