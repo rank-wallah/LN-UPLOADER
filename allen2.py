@@ -5,6 +5,7 @@ import time
 import gc
 import shutil
 import asyncio
+import requests
 import subprocess
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
@@ -50,10 +51,9 @@ app = Client(
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
     workers=16,
-    parse_mode=enums.ParseMode.HTML  # HTML mode for perfect UI styling
+    parse_mode=enums.ParseMode.HTML
 )
 
-# In-memory session tracking per channel
 ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000
 
@@ -66,6 +66,53 @@ def cleanup_workspace():
             print(f"[-] Directory cleanup error: {e}")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# ==========================================
+# ALLEN API AUTO-FETCH METHOD
+# ==========================================
+def fetch_allen_batch_json(token_or_id):
+    """
+    Fetches video batch payload automatically using Bearer token or Batch ID.
+    Modify the URL and headers below as per Allen's current API endpoint format if needed.
+    """
+    headers = {
+        "Authorization": f"Bearer {token_or_id}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+
+    # If user provided a token/URL/ID, call Allen API endpoint
+    # Adjust endpoint URL if you have a specific custom API path
+    api_url = f"https://api.allen.ac.in/v1/batch/contents" if not token_or_id.startswith("http") else token_or_id
+    
+    response = requests.get(api_url, headers=headers, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    
+    # Format API output to normalized item list
+    data_items = []
+    
+    # Parser logic for API structure
+    raw_list = data if isinstance(data, list) else data.get("data", data.get("items", []))
+    for item in raw_list:
+        title = item.get("title") or item.get("topic_name") or item.get("name") or "Lecture Video"
+        url = item.get("url") or item.get("m3u8_url") or item.get("stream_url")
+        is_new_chapter = item.get("is_new_chapter", False) or item.get("is_topic_head", False)
+        
+        if url:
+            data_items.append({
+                "title": title,
+                "url": url,
+                "is_new_chapter": is_new_chapter
+            })
+            
+    return data_items
+
+async def async_fetch_allen_batch_json(token_or_id):
+    return await asyncio.to_thread(fetch_allen_batch_json, token_or_id)
+
+# ==========================================
+# DOWNLOAD & UPLOAD ENGINE
+# ==========================================
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     print(f"\n[+] Starting download: {output_name}")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -81,7 +128,7 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
         "--no-log"
     ]
     
-    if bearer_token:
+    if bearer_token and not bearer_token.startswith("http"):
         cmd.extend(["--header", f"Authorization: Bearer {bearer_token}"])
 
     subprocess.run(cmd, check=True)
@@ -99,7 +146,6 @@ async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
 
 def upload_to_telegram(app_client, target_chat_id, file_path, caption):
     print(f"\n[+] Uploading to target: {target_chat_id}")
-
     sent_msg = app_client.send_video(
         chat_id=target_chat_id,
         video=file_path,
@@ -165,7 +211,7 @@ async def process_batch_async(target_chat_id, data_items, bearer_token=None):
 
         title = item.get("title", f"Topic_{index}")
         m3u8_url = item.get("url")
-        is_new_chapter = item.get("is_new_chapter", False) or item.get("is_topic_head", False)
+        is_new_chapter = item.get("is_new_chapter", False)
 
         if not m3u8_url:
             continue
@@ -177,7 +223,7 @@ async def process_batch_async(target_chat_id, data_items, bearer_token=None):
             
             formatted_caption = (
                 f"<blockquote><i><b>{title}</b>\n\n"
-                f"Uploaded via Downloader Engine</i></blockquote>"
+                f"Uploaded via Allen Downloader Engine</i></blockquote>"
             )
             
             sent_msg = await async_upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
@@ -203,70 +249,7 @@ async def process_batch_async(target_chat_id, data_items, bearer_token=None):
         send_chunked_messages(app, target_chat_id, index_header, index_records, pin_last=True)
 
 # ==========================================
-# OWNER AUTH MANAGEMENT COMMANDS
-# ==========================================
-
-@app.on_message(filters.command("auth"))
-async def authorize_user(client: Client, message: Message):
-    if message.from_user.id != OWNER_ID:
-        await message.reply_text("<blockquote><i>🚫 Only the Bot Owner can authorize users.</i></blockquote>")
-        return
-
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/auth &lt;USER_ID&gt;</code></i></blockquote>")
-        return
-
-    target_id = int(args[1])
-    AUTHORIZED_USERS.add(target_id)
-    save_authorized_users(AUTHORIZED_USERS)
-    
-    msg = (
-        f"<blockquote><i><b>✅ User Authorized Successfully</b>\n\n"
-        f"User ID <code>{target_id}</code> has been granted full access.</i></blockquote>"
-    )
-    await message.reply_text(msg)
-
-@app.on_message(filters.command("unauth"))
-async def unauthorize_user(client: Client, message: Message):
-    if message.from_user.id != OWNER_ID:
-        await message.reply_text("<blockquote><i>🚫 Only the Bot Owner can revoke authorizations.</i></blockquote>")
-        return
-
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/unauth &lt;USER_ID&gt;</code></i></blockquote>")
-        return
-
-    target_id = int(args[1])
-    if target_id == OWNER_ID:
-        await message.reply_text("<blockquote><i>⚠️ You cannot revoke owner privileges.</i></blockquote>")
-        return
-
-    AUTHORIZED_USERS.discard(target_id)
-    save_authorized_users(AUTHORIZED_USERS)
-    
-    msg = (
-        f"<blockquote><i><b>🛑 User Revoked Successfully</b>\n\n"
-        f"User ID <code>{target_id}</code> access has been removed.</i></blockquote>"
-    )
-    await message.reply_text(msg)
-
-@app.on_message(filters.command("authlist"))
-async def list_authorized_users(client: Client, message: Message):
-    if not is_user_authorized(message.from_user.id):
-        await message.reply_text(" catalog: <blockquote><i>🚫 Access Denied.</i></blockquote>")
-        return
-
-    users_str = "\n".join([f"• <code>{u}</code>" + (" (Owner)" if u == OWNER_ID else "") for u in AUTHORIZED_USERS])
-    list_msg = (
-        f"<blockquote><i><b>📋 Authorized Users List:</b>\n\n"
-        f"{users_str}</i></blockquote>"
-    )
-    await message.reply_text(list_msg)
-
-# ==========================================
-# TELEGRAM BOT STYLED UI & COMMANDS
+# COMMAND HANDLERS
 # ==========================================
 
 @app.on_message(filters.command(["start", "help"]) & (filters.group | filters.channel | filters.private))
@@ -275,31 +258,18 @@ async def start_and_help_handler(client: Client, message: Message):
         await message.reply_text("<blockquote><i>🚫 <b>Access Denied</b>\n\nYou are not authorized to use this bot. Contact owner (<code>6789039689</code>) for access.</i></blockquote>")
         return
 
-    # Clean HTML Quoted Layout
     ui_text = (
-        "<blockquote><i>⚡ <b>Multi-Channel Video Downloader Bot</b>\n\n"
-        "This engine processes <code>.json</code> batch files, downloads m3u8 streams using N_m3u8DL-RE, pins chapters/topics, auto-builds an index, and uploads high-speed MP4 videos directly to your target channel.\n\n"
-        "🛠 <b>Available Commands:</b>\n\n"
-        "1️⃣ <code>/batch &lt;BEARER_TOKEN&gt;</code>\n"
-        "Reply to or attach a <code>.json</code> file to start batch downloading.\n\n"
+        "<blockquote><i>⚡ <b>Allen Token Downloader Bot</b>\n\n"
+        "Send your Allen Bearer Token / API Link / Batch ID directly to start downloading without manual JSON files.\n\n"
+        "🛠 <b>Usage:</b>\n\n"
+        "1️⃣ <code>/batch &lt;TOKEN_OR_BATCH_ID&gt;</code>\n"
+        "Auto-fetches batch contents from API and starts downloading.\n\n"
         "2️⃣ <code>/stop</code>\n"
-        "Cancel active downloading and uploading task.\n\n"
+        "Cancel active downloading task.\n\n"
         "3️⃣ <code>/id</code>\n"
-        "Fetch current chat/channel ID.\n\n"
-        "4️⃣ <code>/help</code>\n"
-        "Display this instructions panel.\n\n"
-        "🔑 <b>Admin Controls (Owner Only):</b>\n"
-        "• <code>/auth &lt;USER_ID&gt;</code> - Grant user access\n"
-        "• <code>/unauth &lt;USER_ID&gt;</code> - Revoke user access\n"
-        "• <code>/authlist</code> - List authorized users\n\n"
-        "📑 <b>Index & Pinning System:</b>\n"
-        "Every topic/chapter is tracked and auto-indexed with hyperlinked posts upon completion.</i></blockquote>"
+        "Get current Chat ID.</i></blockquote>"
     )
-    
-    await message.reply_text(
-        text=ui_text,
-        disable_web_page_preview=True
-    )
+    await message.reply_text(text=ui_text, disable_web_page_preview=True)
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch_upload(client: Client, message: Message):
@@ -309,47 +279,47 @@ async def handle_batch_upload(client: Client, message: Message):
 
     target_chat_id = message.chat.id
     args = message.text.split(maxsplit=1)
-    bearer_token = args[1].strip() if len(args) > 1 else None
-
-    doc = message.document or (message.reply_to_message.document if message.reply_to_message else None)
-    if not doc or not doc.file_name.endswith(".json"):
-        error_msg = (
-            "<blockquote><i>⚠️ <b>Invalid Request</b>\n\n"
-            "Please reply to or attach a valid <code>.json</code> batch file with the command <code>/batch &lt;BEARER_TOKEN&gt;</code>.</i></blockquote>"
-        )
-        await message.reply_text(error_msg)
+    
+    if len(args) < 2:
+        await message.reply_text("<blockquote><i>⚠️ <b>Missing Token/ID</b>\n\nUsage: <code>/batch YOUR_BEARER_TOKEN_OR_BATCH_ID</code></i></blockquote>")
         return
+
+    token_or_id = args[1].strip()
 
     if ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
-        already_running_msg = (
-            "<blockquote><i>⚠️ <b>Task Already Active</b>\n\n"
-            "A batch task is currently running in this chat. Send <code>/stop</code> first to cancel it.</i></blockquote>"
-        )
-        await message.reply_text(already_running_msg)
+        await message.reply_text("<blockquote><i>⚠️ <b>Task Already Active</b>\n\nA batch task is currently running in this chat. Send <code>/stop</code> first.</i></blockquote>")
         return
 
-    json_path = await message.download()
-    with open(json_path, "r", encoding="utf-8") as f:
-        data_items = json.load(f)
-    os.remove(json_path)
-
-    ACTIVE_JOBS[target_chat_id] = {"running": True, "token": bearer_token}
-    
-    start_msg = (
-        f"<blockquote><i>🚀 <b>Batch Process Triggered</b>\n\n"
-        f"• Target Chat ID: <code>{target_chat_id}</code>\n"
-        f"• Total Queue Items: <code>{len(data_items)}</code>\n"
-        f"• Status: Running...</i></blockquote>"
-    )
-    await message.reply_text(start_msg)
+    status_msg = await message.reply_text("<blockquote><i>🔄 <b>Fetching Batch Data from Allen API...</b></i></blockquote>")
 
     try:
-        await process_batch_async(target_chat_id, data_items, bearer_token)
+        # Fetching JSON dynamically using token
+        data_items = await async_fetch_allen_batch_json(token_or_id)
+        
+        if not data_items:
+            await status_msg.edit_text("<blockquote><i>❌ <b>No videos/m3u8 links found in the batch payload.</b> Check token validity.</i></blockquote>")
+            return
+
+        ACTIVE_JOBS[target_chat_id] = {"running": True, "token": token_or_id}
+        
+        start_msg = (
+            f"<blockquote><i>🚀 <b>Batch Process Started</b>\n\n"
+            f"• Target Chat ID: <code>{target_chat_id}</code>\n"
+            f"• Total Queue Videos: <code>{len(data_items)}</code>\n"
+            f"• Status: Downloading & Uploading...</i></blockquote>"
+        )
+        await status_msg.edit_text(start_msg)
+
+        await process_batch_async(target_chat_id, data_items, token_or_id)
+        
         complete_msg = (
             "<blockquote><i>✅ <b>Batch Processing Completed</b>\n\n"
-            "All items were processed and master index published successfully.</i></blockquote>"
+            "All items downloaded, uploaded, pinned, and master index generated!</i></blockquote>"
         )
         await message.reply_text(complete_msg)
+
+    except Exception as e:
+        await message.reply_text(f"<blockquote><i>❌ <b>Failed to fetch batch data:</b> <code>{str(e)}</code></i></blockquote>")
     finally:
         ACTIVE_JOBS[target_chat_id] = {"running": False, "token": None}
 
@@ -362,25 +332,17 @@ async def stop_batch_upload(client: Client, message: Message):
     target_chat_id = message.chat.id
     if ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
         ACTIVE_JOBS[target_chat_id]["running"] = False
-        stop_msg = "<blockquote><i>🛑 <b>Cancellation Initiated</b>\n\nStop signal sent to active queue.</i></blockquote>"
-        await message.reply_text(stop_msg)
+        await message.reply_text("<blockquote><i>🛑 <b>Cancellation Initiated</b>\n\nStop signal sent.</i></blockquote>")
     else:
-        no_task_msg = "<blockquote><i>⚠️ <b>No Active Task</b>\n\nThere are no active tasks running in this chat.</i></blockquote>"
-        await message.reply_text(no_task_msg)
+        await message.reply_text("<blockquote><i>⚠️ <b>No Active Task</b></i></blockquote>")
 
 @app.on_message(filters.command("id"))
 async def show_chat_id(client: Client, message: Message):
-    id_msg = (
-        f"<blockquote><i>🆔 <b>Current Chat Metadata</b>\n\n"
-        f"• Chat ID: <code>{message.chat.id}</code>\n"
-        f"• User ID: <code>{message.from_user.id if message.from_user else 'Channel'}</code>\n"
-        f"• Chat Type: <code>{message.chat.type}</code></i></blockquote>"
-    )
-    await message.reply_text(id_msg)
+    await message.reply_text(f"<blockquote><i>🆔 <b>Chat ID:</b> <code>{message.chat.id}</code></i></blockquote>")
 
 def main():
     cleanup_workspace()
-    print("[+] Optimized Multi-Channel Authorized Downloader Engine Started...")
+    print("[+] Allen Token Downloader Engine Started...")
     app.run()
 
 if __name__ == "__main__":
