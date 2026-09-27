@@ -33,6 +33,7 @@ AUTH_FILE = "authorized_users.json"
 SESSION_FILE = "allen_session.json"
 DOWNLOAD_DIR = "./downloads"
 
+
 def load_authorized_users():
     if os.path.exists(AUTH_FILE):
         try:
@@ -42,6 +43,7 @@ def load_authorized_users():
             logger.error(f"Error loading auth file: {e}")
     return {OWNER_ID}
 
+
 def save_authorized_users(users_set):
     try:
         with open(AUTH_FILE, "w") as f:
@@ -49,10 +51,13 @@ def save_authorized_users(users_set):
     except Exception as e:
         logger.error(f"Error saving auth file: {e}")
 
+
 AUTHORIZED_USERS = load_authorized_users()
+
 
 def is_user_authorized(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id in AUTHORIZED_USERS
+
 
 # ==========================================
 # SESSION MANAGEMENT (TOKEN & CREDS)
@@ -64,6 +69,7 @@ def save_allen_session(data):
     except Exception as e:
         logger.error(f"Error saving session: {e}")
 
+
 def get_allen_session():
     if os.path.exists(SESSION_FILE):
         try:
@@ -73,9 +79,11 @@ def get_allen_session():
             logger.error(f"Error reading session: {e}")
     return {}
 
+
 def get_allen_token():
     session = get_allen_session()
     return session.get("access_token") or session.get("token")
+
 
 app = Client(
     "allen_downloader_bot",
@@ -90,6 +98,7 @@ ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000
 ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
 
+
 def cleanup_workspace():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     for item in os.listdir(DOWNLOAD_DIR):
@@ -102,12 +111,28 @@ def cleanup_workspace():
         except Exception as e:
             logger.warning(f"Cleanup lock on {item} (ignoring): {e}")
 
+
+def validate_runtime_config():
+    missing = []
+    if not TG_API_ID or TG_API_ID == 0:
+        missing.append("TG_API_ID")
+    if not TG_API_HASH:
+        missing.append("TG_API_HASH")
+    if not TG_BOT_TOKEN:
+        missing.append("TG_BOT_TOKEN")
+    if missing:
+        raise SystemExit(
+            "Missing required env vars: " + ", ".join(missing) + ". "
+            "Set them before running the bot."
+        )
+
+
 # ==========================================
 # ID * PASS RECON & AUTHENTICATION ENGINE
 # ==========================================
 
 def allen_login_idpass(username, password):
-    """Direct ID*PASS Authentication Flow with multiple DeviceID strategies and debugging."""
+    """Direct ID*PASS Authentication Flow with DeviceID support and fallback strategies."""
     login_endpoints = [
         "https://api.allen-live.in/api/v1/auth/username",
         "https://api.allen.in/v1/auth/login",
@@ -122,7 +147,7 @@ def allen_login_idpass(username, password):
         "grant_type": "password",
         "DeviceID": device_id,
         "deviceId": device_id,
-        "device_id": device_id
+        "device_id": device_id,
     }
 
     base_headers = {
@@ -130,95 +155,51 @@ def allen_login_idpass(username, password):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/"
+        "Referer": "https://api.allen.in/",
+        "DeviceID": device_id,
+        "device-id": device_id,
+        "deviceId": device_id,
     }
-    device_header_variants = [
-        ("DeviceID", device_id),
-        ("device-id", device_id),
-        ("deviceId", device_id),
-        ("deviceid", device_id),
-        ("X-Device-Id", device_id),
-        ("x-device-id", device_id),
-        ("X-DeviceID", device_id),
-    ]
 
     error_log = []
 
     for endpoint in login_endpoints:
         logger.info(f"Attempting auth via {endpoint} (device_id={device_id})...")
-        headers = base_headers.copy()
-        for k, v in device_header_variants[:3]:
-            headers[k] = v
 
-        try:
-            res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+        for mode in ["json", "form", "params"]:
             try:
-                logger.debug(f"Request to {endpoint} headers: {res.request.headers}")
-                body = res.request.body
-                logger.debug(f"Request body: {body.decode() if isinstance(body, bytes) else body}")
-            except Exception:
-                logger.debug("Could not log request details")
+                if mode == "json":
+                    headers = base_headers.copy()
+                    res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+                elif mode == "form":
+                    headers = {**base_headers, "Content-Type": "application/x-www-form-urlencoded"}
+                    res = requests.post(endpoint, data=payload, headers=headers, timeout=15)
+                else:
+                    headers = {k: v for k, v in base_headers.items() if k.lower() != "content-type"}
+                    res = requests.post(endpoint, json=payload, headers=headers, params={"device_id": device_id}, timeout=15)
 
-            if res.status_code == 200:
-                data = res.json()
-                token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
-                if token:
-                    save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                    logger.info(f"Auth successful on {endpoint} (json + headers)")
-                    return token
-            else:
-                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] HTTP {res.status_code}: {res.text[:200]}"
-                error_log.append(err_msg)
-                logger.warning(err_msg)
-
-            if res.status_code == 400 and "DeviceID" in (res.text or ""):
-                headers2 = base_headers.copy()
-                headers2["Content-Type"] = "application/x-www-form-urlencoded"
-                for k, v in device_header_variants[:4]:
-                    headers2[k] = v
-                res2 = requests.post(endpoint, data=payload, headers=headers2, timeout=15)
-                try:
-                    logger.debug(f"Form request to {endpoint} headers: {res2.request.headers}")
-                    logger.debug(f"Form request body: {res2.request.body}")
-                except Exception:
-                    logger.debug("Form request body could not be decoded for logging.")
-                if res2.status_code == 200:
-                    data = res2.json()
+                if res.status_code == 200:
+                    data = res.json()
                     token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
                     if token:
                         save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                        logger.info(f"Auth successful on {endpoint} (form + headers)")
+                        logger.info(f"Auth successful on {endpoint} using {mode}")
                         return token
+                    else:
+                        logger.warning(f"Auth endpoint {endpoint} returned 200 but no token: {data}")
                 else:
-                    err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Form HTTP {res2.status_code}: {res2.text[:200]}"
+                    err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] {mode.upper()} HTTP {res.status_code}: {res.text[:200]}"
                     error_log.append(err_msg)
                     logger.warning(err_msg)
 
-            params = {"device_id": device_id}
-            res3 = requests.post(endpoint, json=payload, headers=base_headers, params=params, timeout=15)
-            try:
-                logger.debug(f"Query-param request to {endpoint} url: {res3.url}")
-            except Exception:
-                pass
-            if res3.status_code == 200:
-                data = res3.json()
-                token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
-                if token:
-                    save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                    logger.info(f"Auth successful on {endpoint} (json + params)")
-                    return token
-            else:
-                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Params HTTP {res3.status_code}: {res3.text[:200]}"
+            except Exception as e:
+                err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] {mode.upper()} request failed: {str(e)}"
                 error_log.append(err_msg)
                 logger.warning(err_msg)
 
-        except Exception as e:
-            err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] Request failed: {e}"
-            error_log.append(err_msg)
-            logger.warning(err_msg)
-
     combined_errors = "\n".join(error_log)
     raise ValueError(f"Login failed across all endpoints:\n{combined_errors}")
+
 
 def fetch_batch_contents(batch_id, token):
     url = f"{ALLEN_BASE_URL}/batch/{batch_id}/contents"
@@ -251,6 +232,7 @@ def fetch_batch_contents(batch_id, token):
 
     return data_items
 
+
 # ==========================================
 # HIGH SPEED DOWNLOAD & UPLOAD ENGINE
 # ==========================================
@@ -279,8 +261,10 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
                 return os.path.join(DOWNLOAD_DIR, file)
     return output_path
 
+
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token)
+
 
 def upload_to_telegram(app_client, target_chat_id, file_path, caption):
     return app_client.send_video(
@@ -290,8 +274,10 @@ def upload_to_telegram(app_client, target_chat_id, file_path, caption):
         supports_streaming=True
     )
 
+
 async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
     return await asyncio.to_thread(upload_to_telegram, app_client, target_chat_id, file_path, caption)
+
 
 # ==========================================
 # TELEGRAM BOT COMMAND HANDLERS
@@ -323,6 +309,7 @@ async def handle_auth(client: Client, message: Message):
     except ValueError:
         await message.reply_text("<blockquote><i>⚠️ Invalid User ID.</i></blockquote>")
 
+
 @app.on_message(filters.command("login") & (filters.group | filters.channel | filters.private))
 async def handle_login(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else "Unknown"
@@ -331,6 +318,9 @@ async def handle_login(client: Client, message: Message):
     if message.from_user and not is_user_authorized(message.from_user.id):
         logger.warning(f"Unauthorized access attempt by {user_id}")
         await message.reply_text("<blockquote><i>🚫 Access Denied. Contact Admin.</i></blockquote>")
+        return
+
+    if not message.text:
         return
 
     args = message.text.split(maxsplit=1)
@@ -347,6 +337,7 @@ async def handle_login(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
+
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
@@ -405,6 +396,7 @@ async def handle_batch(client: Client, message: Message):
     finally:
         ACTIVE_JOBS[target_chat_id] = {"running": False}
 
+
 @app.on_message(filters.command("stop"))
 async def handle_stop(client: Client, message: Message):
     chat_id = message.chat.id
@@ -414,15 +406,24 @@ async def handle_stop(client: Client, message: Message):
     else:
         await message.reply_text("<blockquote><i>⚠️ No active task running in this chat.</i></blockquote>")
 
+
 @app.on_message(filters.command("id"))
 async def show_id(client: Client, message: Message):
     await message.reply_text(f"<blockquote><i>🆔 Chat ID: <code>{message.chat.id}</code></i></blockquote>")
 
+
 def main():
+    try:
+        validate_runtime_config()
+    except SystemExit as e:
+        print(str(e))
+        raise
+
     logger.info("Initializing workspace cleanup...")
     cleanup_workspace()
     logger.info("Workspace clean. Booting Pyrogram engine...")
     app.run()
+
 
 if __name__ == "__main__":
     main()
