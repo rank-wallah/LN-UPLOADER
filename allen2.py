@@ -4,18 +4,19 @@ import json
 import time
 import subprocess
 import requests
-from pyrogram import Client
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
 # ==========================================
-# ENVIRONMENT CONFIGURATION
+# ENVIRONMENT CONFIGURATION (NO HARDCODED SECRETS)
 # ==========================================
-TG_API_ID = int(os.getenv("TG_API_ID", "33020321"))
-TG_API_HASH = os.getenv("TG_API_HASH", "d870b78e4b663aad6eb358fbdec2807d")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "8991581483:AAHDBtqMfJjckOPpnijBpsNNknvQAh_xOwY")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "@JEELeaderOnlineCourse")
+TG_API_ID = int(os.getenv("TG_API_ID", "0"))
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FRIENDS_BEARER_TOKEN = os.getenv("FRIENDS_BEARER_TOKEN", "")
 
-# Initialize Pyrogram Bot Client with high-speed workers
+# Initialize Pyrogram Bot Client
 app = Client(
     "allen_downloader_bot",
     api_id=TG_API_ID,
@@ -23,6 +24,9 @@ app = Client(
     bot_token=TG_BOT_TOKEN,
     workers=16
 )
+
+# Active status flags & runtime config
+PROCESSING_ACTIVE = False
 
 def progress_bar(current, total, status):
     percent = (current / total) * 100
@@ -57,6 +61,7 @@ def upload_to_telegram(app_client, file_path, caption):
     print("\n[+] Upload completed successfully.")
 
 def process_subject(json_file):
+    global FRIENDS_BEARER_TOKEN
     if not os.path.exists(json_file):
         print(f"[-] File not found: {json_file}")
         return
@@ -66,6 +71,10 @@ def process_subject(json_file):
 
     os.makedirs("./downloads", exist_ok=True)
 
+    headers = {}
+    if FRIENDS_BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {FRIENDS_BEARER_TOKEN}"
+
     for index, item in enumerate(data, start=1):
         title = item.get("title", f"Video_{index}")
         m3u8_url = item.get("url")
@@ -74,7 +83,6 @@ def process_subject(json_file):
             continue
 
         clean_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).rstrip()
-        output_file_path = f"./downloads/{clean_title}.mp4"
 
         try:
             downloaded_path = download_m3u8(m3u8_url, clean_title)
@@ -85,19 +93,43 @@ def process_subject(json_file):
         except Exception as e:
             print(f"\n[-] Error processing {title}: {str(e)}")
 
-def main():
-    print("[+] Starting Allen Downloader Worker Process...")
-    app.start()
+# Telegram Bot Commands for Dynamic Control
+@app.on_message(filters.command("settoken"))
+def set_bearer_token(client: Client, message: Message):
+    global FRIENDS_BEARER_TOKEN
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        FRIENDS_BEARER_TOKEN = args[1].strip()
+        message.reply_text("✅ Friends Bearer Token updated successfully.")
+        print(f"[+] Friends Bearer Token updated via Telegram command.")
+    else:
+        message.reply_text("⚠️ Usage: `/settoken <YOUR_BEARER_TOKEN>`")
+
+@app.on_message(filters.command("startdownload"))
+def start_download_process(client: Client, message: Message):
+    global PROCESSING_ACTIVE
+    if PROCESSING_ACTIVE:
+        message.reply_text("⚠️ Processing is already active.")
+        return
+
+    PROCESSING_ACTIVE = True
+    message.reply_text("🚀 Starting download and upload queue...")
     
-    # Process target JSON configurations sequentially
     for subject_json in ["physics.json", "chemistry.json", "maths.json"]:
-        print(f"\n==========================================")
-        print(f"[+] Processing JSON targets: {subject_json}")
-        print(f"==========================================")
+        print(f"\n[+] Processing JSON targets: {subject_json}")
         process_subject(subject_json)
 
-    print("\n[+] All tasks finished. Execution completed.")
-    app.stop()
+    PROCESSING_ACTIVE = False
+    message.reply_text("✅ All tasks finished successfully.")
+
+@app.on_message(filters.command("status"))
+def check_status(client: Client, message: Message):
+    token_status = "Set" if FRIENDS_BEARER_TOKEN else "Not Set"
+    message.reply_text(f"📊 **Status:**\n• Token: `{token_status}`\n• Running: `{PROCESSING_ACTIVE}`")
+
+def main():
+    print("[+] Bot initialized and listening for commands...")
+    app.run()
 
 if __name__ == "__main__":
     main()
