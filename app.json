@@ -1,6 +1,6 @@
 {
-  "name": "JEE-Leader-Downloader",
-  "description": "High-speed Telegram video stream uploader using Pyrogram and N_m3u8DL-RE",
+  "name": "JEE-Leader-MultiChannel-Downloader",
+  "description": "Multi-target channel downloader engine supporting separate tokens per channel batch.",
   "repository": "https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME",
   "keywords": ["telegram", "pyrogram", "m3u8", "downloader", "heroku"],
   "stack": "container",
@@ -19,16 +19,6 @@
       "description": "Telegram Bot Token",
       "value": "8991581483:AAHDBtqMfJjckOPpnijBpsNNknvQAh_xOwY",
       "required": true
-    },
-    "TG_CHAT_ID": {
-      "description": "Telegram Target Channel or Chat ID",
-      "value": "@JEELeaderOnlineCourse",
-      "required": true
-    },
-    "FRIENDS_BEARER_TOKEN": {
-      "description": "Friends Bearer Auth Token (Optional at deploy, can be set via Telegram /settoken command)",
-      "value": "",
-      "required": false
     }
   },
   "formation": {
