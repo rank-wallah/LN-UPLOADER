@@ -26,9 +26,9 @@
       "required": true
     },
     "FRIENDS_BEARER_TOKEN": {
-      "description": "Friends Bearer Auth Token",
+      "description": "Friends Bearer Auth Token (Optional at deploy, can be set via Telegram /settoken command)",
       "value": "",
-      "required": true
+      "required": false
     }
   },
   "formation": {
