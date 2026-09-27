@@ -8,11 +8,38 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # ==========================================
-# ENVIRONMENT CONFIGURATION
+# ENVIRONMENT CONFIGURATION & OWNER AUTH
 # ==========================================
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+
+# Default Owner Telegram User ID
+OWNER_ID = int(os.getenv("OWNER_ID", "6789039689"))
+
+AUTH_FILE = "authorized_users.json"
+
+def load_authorized_users():
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, "r") as f:
+                users = json.load(f)
+                return set(int(u) for u in users)
+        except Exception as e:
+            print(f"[-] Error loading auth file: {e}")
+    return {OWNER_ID}
+
+def save_authorized_users(users_set):
+    try:
+        with open(AUTH_FILE, "w") as f:
+            json.dump(list(users_set), f)
+    except Exception as e:
+        print(f"[-] Error saving auth file: {e}")
+
+AUTHORIZED_USERS = load_authorized_users()
+
+def is_user_authorized(user_id: int) -> bool:
+    return user_id == OWNER_ID or user_id in AUTHORIZED_USERS
 
 app = Client(
     "allen_downloader_bot",
@@ -106,9 +133,6 @@ def send_chunked_messages(app_client, target_chat_id, header, index_items, pin_l
             print(f"[-] Could not pin final index: {e}")
 
 def get_message_link(chat_id, msg_id):
-    """
-    Generates standard Telegram link format for messages in channel/group.
-    """
     chat_str = str(chat_id)
     if chat_str.startswith("-100"):
         real_id = chat_str[4:]
@@ -135,7 +159,6 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
         try:
             downloaded_path = download_m3u8(m3u8_url, clean_title, bearer_token)
             
-            # Quoted & Italicized Caption Style
             formatted_caption = (
                 f"> *{title}*\n"
                 f">\n"
@@ -145,14 +168,12 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
             sent_msg = upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
             msg_link = get_message_link(target_chat_id, sent_msg.id)
 
-            # Auto-pin new chapters/topics if flagged
             if is_new_chapter or index == 1:
                 try:
                     app.pin_chat_message(target_chat_id, sent_msg.id)
                 except Exception as pin_err:
                     print(f"[-] Pinning failed: {pin_err}")
 
-            # Keep track for the master index
             index_records.append({"title": title, "link": msg_link})
             
             if os.path.exists(downloaded_path):
@@ -160,7 +181,6 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
         except Exception as e:
             print(f"\n[-] Error processing {title}: {str(e)}")
 
-    # Generate & Send Master Index at the end
     if index_records and ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
         index_header = (
             f"> _📌 **BATCH MASTER INDEX**_\n"
@@ -171,11 +191,81 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
         send_chunked_messages(app, target_chat_id, index_header, index_records, pin_last=True)
 
 # ==========================================
+# OWNER AUTH MANAGEMENT COMMANDS
+# ==========================================
+
+@app.on_message(filters.command("auth"))
+def authorize_user(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        message.reply_text("> _🚫 Only the Bot Owner can authorize users._")
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        message.reply_text("> _⚠️ Usage: `/auth <USER_ID>`_")
+        return
+
+    target_id = int(args[1])
+    AUTHORIZED_USERS.add(target_id)
+    save_authorized_users(AUTHORIZED_USERS)
+    
+    msg = (
+        f"> _✅ **User Authorized Successfully**_\n"
+        f">\n"
+        f"> _User ID `{target_id}` has been granted full access to the bot._"
+    )
+    message.reply_text(msg)
+
+@app.on_message(filters.command("unauth"))
+def unauthorize_user(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        message.reply_text("> _🚫 Only the Bot Owner can revoke authorizations._")
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        message.reply_text("> _⚠️ Usage: `/unauth <USER_ID>`_")
+        return
+
+    target_id = int(args[1])
+    if target_id == OWNER_ID:
+        message.reply_text("> _⚠️ You cannot revoke owner privileges._")
+        return
+
+    AUTHORIZED_USERS.discard(target_id)
+    save_authorized_users(AUTHORIZED_USERS)
+    
+    msg = (
+        f"> _🛑 **User Revoked Successfully**_\n"
+        f">\n"
+        f"> _User ID `{target_id}` access has been removed._"
+    )
+    message.reply_text(msg)
+
+@app.on_message(filters.command("authlist"))
+def list_authorized_users(client: Client, message: Message):
+    if not is_user_authorized(message.from_user.id):
+        message.reply_text("> _🚫 Access Denied._")
+        return
+
+    users_str = "\n".join([f"> • `{u}`" + (" (Owner)" if u == OWNER_ID else "") for u in AUTHORIZED_USERS])
+    list_msg = (
+        f"> _📋 **Authorized Users List:**_\n"
+        f">\n"
+        f"{users_str}"
+    )
+    message.reply_text(list_msg)
+
+# ==========================================
 # TELEGRAM BOT STYLED UI & COMMANDS
 # ==========================================
 
 @app.on_message(filters.command(["start", "help"]) & (filters.group | filters.channel | filters.private))
 def start_and_help_handler(client: Client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        message.reply_text("> _🚫 **Access Denied**_\n>\n> _You are not authorized to use this bot. Contact the owner (`6789039689`) for access._")
+        return
+
     ui_text = (
         f"> _⚡ **Multi-Channel Video Downloader Bot**_\n"
         f">\n"
@@ -195,8 +285,13 @@ def start_and_help_handler(client: Client, message: Message):
         f"> 4️⃣ `/help`\n"
         f"> _Display this instructions panel._\n"
         f">\n"
+        f"> 🔑 *__Admin Controls (Owner Only):__*\n"
+        f"> _`/auth <USER_ID>` - Grant user access_\n"
+        f"> _`/unauth <USER_ID>` - Revoke user access_\n"
+        f"> _`/authlist` - List authorized users_\n"
+        f">\n"
         f"> 📑 *__Index & Pinning System:__*\n"
-        f"> _Every topic/chapter is tracked. Upon completion, a hyperlinked Index message is created and pinned. If word limits exceed Telegram bounds, it automatically splits across multiple messages._"
+        f"> _Every topic/chapter is tracked. Upon completion, a hyperlinked Index message is created and pinned formatted as `([TOPIC](https://t.me/c/...))`._"
     )
     
     message.reply_text(
@@ -206,8 +301,11 @@ def start_and_help_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 def handle_batch_upload(client: Client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        message.reply_text("> _🚫 Access Denied._")
+        return
+
     target_chat_id = message.chat.id
-    
     args = message.text.split(maxsplit=1)
     bearer_token = args[1].strip() if len(args) > 1 else None
 
@@ -260,6 +358,10 @@ def handle_batch_upload(client: Client, message: Message):
 
 @app.on_message(filters.command("stop") & (filters.group | filters.channel | filters.private))
 def stop_batch_upload(client: Client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        message.reply_text("> _🚫 Access Denied._")
+        return
+
     target_chat_id = message.chat.id
     if ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
         ACTIVE_JOBS[target_chat_id]["running"] = False
@@ -283,12 +385,13 @@ def show_chat_id(client: Client, message: Message):
         f"> _🆔 **Current Chat Metadata**_\n"
         f">\n"
         f"> _Chat ID: `{message.chat.id}`_\n"
+        f"> _User ID: `{message.from_user.id if message.from_user else 'Channel'}`_\n"
         f"> _Chat Type: `{message.chat.type}`_"
     )
     message.reply_text(id_msg)
 
 def main():
-    print("[+] Multi-Channel Downloader Engine Started...")
+    print("[+] Multi-Channel Authorized Downloader Engine Started...")
     app.run()
 
 if __name__ == "__main__":
