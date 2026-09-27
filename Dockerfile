@@ -1,0 +1,30 @@
+FROM python:3.10-slim
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    wget \
+    tar \
+    ca-certificates \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install high-performance binary N_m3u8DL-RE
+RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.0-beta/N_m3u8DL-RE_Beta_linux-x64_20230628.tar.gz -O re.tar.gz \
+    && tar -xvf re.tar.gz \
+    && mv N_m3u8DL-RE_Beta_linux-x64/N_m3u8DL-RE /usr/local/bin/ \
+    && chmod +x /usr/local/bin/N_m3u8DL-RE \
+    && rm -rf re.tar.gz N_m3u8DL-RE_Beta_linux-x64
+
+WORKDIR /app
+
+# Install Python modules
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy source repository
+COPY . .
+
+# Run application
+CMD ["python", "allen2.py"]
