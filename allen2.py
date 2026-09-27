@@ -97,7 +97,8 @@ def allen_login_idpass(username, password):
     login_endpoints = [
         f"{ALLEN_BASE_URL}/user/login",
         f"{ALLEN_BASE_URL}/auth/login",
-        "https://api.allen.ac.in/v1/auth/login"
+        "https://api.allen.in/v1/auth/login",
+        "https://user.allen.in/api/v1/login"
     ]
     
     payload = {
@@ -114,7 +115,7 @@ def allen_login_idpass(username, password):
         "Referer": "https://app.allen.in/"
     }
 
-    last_error = None
+    last_error = "No valid response from any endpoint."
     for endpoint in login_endpoints:
         try:
             res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
@@ -124,11 +125,13 @@ def allen_login_idpass(username, password):
                 if token:
                     save_allen_session({"username": username, "token": token, "login_time": time.time()})
                     return token
+            else:
+                last_error = f"HTTP {res.status_code} on {endpoint}: {res.text[:100]}"
         except Exception as e:
-            last_error = e
+            last_error = f"Request failed on {endpoint}: {str(e)}"
             continue
 
-    raise ValueError(f"Login failed across all endpoints. Error: {last_error}")
+    raise ValueError(f"Login failed across all endpoints. Last Error: {last_error}")
 
 def fetch_batch_contents(batch_id, token):
     """Fetches full hierarchy & content list for given Batch ID"""
@@ -325,7 +328,7 @@ async def show_id(client: Client, message: Message):
 
 def main():
     cleanup_workspace()
-    print("[+] Full 380+ Line Structure Restored with ID*PASS Auto-Auth Engine...")
+    print("[+] Full Structure Restored with Patched Auto-Auth Engine...")
     app.run()
 
 if __name__ == "__main__":
