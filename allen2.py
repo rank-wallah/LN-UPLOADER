@@ -8,6 +8,7 @@ import asyncio
 import requests
 import subprocess
 import logging
+import uuid
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
@@ -104,7 +105,6 @@ def cleanup_workspace():
 # ==========================================
 # ID * PASS RECON & AUTHENTICATION ENGINE
 # ==========================================
-
 def allen_login_idpass(username, password):
     """Direct ID*PASS Authentication Flow"""
     login_endpoints = [
@@ -112,23 +112,31 @@ def allen_login_idpass(username, password):
         "https://api.allen.in/v1/auth/login",
         "https://api.allen.ac.in/v1/auth/login"
     ]
-    
+
+    # dynamic device ID for API compatibility
+    device_id = str(uuid.uuid4())
+
     payload = {
         "username": username,
         "password": password,
-        "grant_type": "password"
+        "grant_type": "password",
+        "DeviceID": device_id,
+        "deviceId": device_id,
+        "device_id": device_id
     }
-    
+
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/"
+        "Referer": "https://api.allen.in/",
+        "DeviceID": device_id,
+        "device-id": device_id
     }
 
     error_log = []
-    
+
     for endpoint in login_endpoints:
         logger.info(f"Attempting auth via {endpoint}...")
         try:
@@ -141,7 +149,6 @@ def allen_login_idpass(username, password):
                     logger.info(f"Auth successful on {endpoint}")
                     return token
             else:
-                # Capture the actual API rejection reason
                 err_msg = f"[{endpoint.split('//')[1].split('/')[0]}] HTTP {res.status_code}: {res.text[:60]}"
                 error_log.append(err_msg)
                 logger.warning(err_msg)
@@ -160,20 +167,20 @@ def fetch_batch_contents(batch_id, token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-    
+
     res = requests.get(url, headers=headers, timeout=25)
     res.raise_for_status()
     data = res.json()
-    
+
     data_items = []
     raw_list = data if isinstance(data, list) else data.get("data", data.get("items", []))
-    
+
     for item in raw_list:
         title = item.get("title") or item.get("topic_name") or item.get("name") or "Lecture"
         m3u8_url = item.get("url") or item.get("m3u8_url") or item.get("stream_url") or item.get("video_url")
         pdf_url = item.get("pdf_url") or item.get("document_url")
         is_new_chapter = item.get("is_new_chapter", False)
-        
+
         if m3u8_url or pdf_url:
             data_items.append({
                 "title": title,
@@ -181,13 +188,12 @@ def fetch_batch_contents(batch_id, token):
                 "pdf": pdf_url,
                 "is_new_chapter": is_new_chapter
             })
-            
+
     return data_items
 
 # ==========================================
 # HIGH SPEED DOWNLOAD & UPLOAD ENGINE
 # ==========================================
-
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     cmd = [
@@ -205,7 +211,7 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
 
     subprocess.run(cmd, check=True)
     output_path = os.path.join(DOWNLOAD_DIR, f"{output_name}.mp4")
-    
+
     if not os.path.exists(output_path):
         for file in os.listdir(DOWNLOAD_DIR):
             if file.startswith(output_name):
@@ -260,7 +266,7 @@ async def handle_auth(client: Client, message: Message):
 async def handle_login(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else "Unknown"
     logger.info(f"/login triggered by {user_id}")
-    
+
     if message.from_user and not is_user_authorized(message.from_user.id):
         logger.warning(f"Unauthorized access attempt by {user_id}")
         await message.reply_text("<blockquote><i>🚫 Access Denied. Contact Admin.</i></blockquote>")
@@ -323,9 +329,9 @@ async def handle_batch(client: Client, message: Message):
             if item.get("url"):
                 video_path = await async_download_m3u8(item["url"], clean_title, token)
                 caption = f"<blockquote><i><b>{title}</b>\n\nAllen High-Speed Auto-Downloader</i></blockquote>"
-                
+
                 await async_upload_to_telegram(app, target_chat_id, video_path, caption)
-                
+
                 if os.path.exists(video_path):
                     os.remove(video_path)
                 gc.collect()
