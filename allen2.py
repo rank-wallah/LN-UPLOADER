@@ -5,7 +5,7 @@ import time
 import subprocess
 import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message
 
 # ==========================================
 # ENVIRONMENT CONFIGURATION
@@ -24,6 +24,7 @@ app = Client(
 
 # In-memory session tracking per channel
 ACTIVE_JOBS = {}
+MAX_TG_MSG_LEN = 4000  # Safe margin below 4096 Telegram limit
 
 def progress_bar(current, total, status):
     percent = (current / total) * 100
@@ -55,22 +56,76 @@ def upload_to_telegram(app_client, target_chat_id, file_path, caption):
     def progress(current, total):
         progress_bar(current, total, "Uploading")
 
-    app_client.send_video(
+    sent_msg = app_client.send_video(
         chat_id=target_chat_id,
         video=file_path,
         caption=caption,
         progress=progress
     )
     print("\n[+] Upload completed successfully.")
+    return sent_msg
+
+def send_chunked_messages(app_client, target_chat_id, header, index_items, pin_last=True):
+    """
+    Handles Telegram character limits by chunking large index lists into multiple messages.
+    Formats links strictly as: ([CHAPTER_TOPIC](https://t.me/c/<chat_id>/<msg_id>))
+    """
+    messages_to_send = []
+    current_text = header + "\n"
+
+    for idx, item in enumerate(index_items, start=1):
+        line = f"> {idx}. ([{item['title']}]({item['link']}))\n"
+        if len(current_text) + len(line) > MAX_TG_MSG_LEN:
+            messages_to_send.append(current_text)
+            current_text = "> \n" + line
+        else:
+            current_text += line
+
+    if current_text.strip():
+        messages_to_send.append(current_text)
+
+    total_chunks = len(messages_to_send)
+    last_sent_msg = None
+
+    for i, msg_text in enumerate(messages_to_send, start=1):
+        if total_chunks > 1:
+            chunk_caption = f"{msg_text}\n> \n> _Part {i} of {total_chunks}_"
+        else:
+            chunk_caption = msg_text
+        
+        last_sent_msg = app_client.send_message(
+            chat_id=target_chat_id,
+            text=chunk_caption,
+            disable_web_page_preview=True
+        )
+
+    if pin_last and last_sent_msg:
+        try:
+            app_client.pin_chat_message(target_chat_id, last_sent_msg.id)
+        except Exception as e:
+            print(f"[-] Could not pin final index: {e}")
+
+def get_message_link(chat_id, msg_id):
+    """
+    Generates standard Telegram link format for messages in channel/group.
+    """
+    chat_str = str(chat_id)
+    if chat_str.startswith("-100"):
+        real_id = chat_str[4:]
+        return f"https://t.me/c/{real_id}/{msg_id}"
+    return f"https://t.me/c/{chat_id}/{msg_id}"
 
 def process_batch(target_chat_id, data_items, bearer_token=None):
+    index_records = []
+
     for index, item in enumerate(data_items, start=1):
         if not ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
             print(f"[-] Processing cancelled for chat {target_chat_id}")
             break
 
-        title = item.get("title", f"Video_{index}")
+        title = item.get("title", f"Topic_{index}")
         m3u8_url = item.get("url")
+        is_new_chapter = item.get("is_new_chapter", False) or item.get("is_topic_head", False)
 
         if not m3u8_url:
             continue
@@ -87,12 +142,33 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
                 f"> _Uploaded via Downloader Engine_"
             )
             
-            upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
+            sent_msg = upload_to_telegram(app, target_chat_id, downloaded_path, formatted_caption)
+            msg_link = get_message_link(target_chat_id, sent_msg.id)
+
+            # Auto-pin new chapters/topics if flagged
+            if is_new_chapter or index == 1:
+                try:
+                    app.pin_chat_message(target_chat_id, sent_msg.id)
+                except Exception as pin_err:
+                    print(f"[-] Pinning failed: {pin_err}")
+
+            # Keep track for the master index
+            index_records.append({"title": title, "link": msg_link})
             
             if os.path.exists(downloaded_path):
                 os.remove(downloaded_path)
         except Exception as e:
             print(f"\n[-] Error processing {title}: {str(e)}")
+
+    # Generate & Send Master Index at the end
+    if index_records and ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
+        index_header = (
+            f"> _📌 **BATCH MASTER INDEX**_\n"
+            f">\n"
+            f"> _Below is the complete list of chapters/topics processed in this batch with embedded direct post links:_\n"
+            f">"
+        )
+        send_chunked_messages(app, target_chat_id, index_header, index_records, pin_last=True)
 
 # ==========================================
 # TELEGRAM BOT STYLED UI & COMMANDS
@@ -100,18 +176,15 @@ def process_batch(target_chat_id, data_items, bearer_token=None):
 
 @app.on_message(filters.command(["start", "help"]) & (filters.group | filters.channel | filters.private))
 def start_and_help_handler(client: Client, message: Message):
-    """
-    Styled Start & Help UI Menu using Blockquotes and Italics.
-    """
     ui_text = (
         f"> _⚡ **Multi-Channel Video Downloader Bot**_\n"
         f">\n"
-        f"> _This engine processes `.json` batch files, downloads m3u8 streams using N_m3u8DL-RE, and uploads high-speed MP4 videos directly to your target public/private channels or groups._\n"
+        f"> _This engine processes `.json` batch files, downloads m3u8 streams using N_m3u8DL-RE, pins chapters/topics, auto-builds an index, and uploads high-speed MP4 videos directly to your target channel._\n"
         f">\n"
         f"> 🛠 *__Available Commands:__*\n"
         f">\n"
         f"> 1️⃣ `/batch <BEARER_TOKEN>`\n"
-        f"> _Reply to or attach a `.json` file to start batch downloading. Token is optional._\n"
+        f"> _Reply to or attach a `.json` file to start batch downloading with automatic indexing._\n"
         f">\n"
         f"> 2️⃣ `/stop`\n"
         f"> _Cancel active downloading and uploading task in the current channel._\n"
@@ -122,8 +195,8 @@ def start_and_help_handler(client: Client, message: Message):
         f"> 4️⃣ `/help`\n"
         f"> _Display this instructions panel._\n"
         f">\n"
-        f"> 🔒 *__Private Channel Deployment:__*\n"
-        f"> _Add this bot as an **Administrator** in your target private channel with full permissions to post videos, then execute `/batch` directly inside the channel or forward the batch file with the chat ID._"
+        f"> 📑 *__Index & Pinning System:__*\n"
+        f"> _Every topic/chapter is tracked. Upon completion, a hyperlinked Index message is created and pinned. If word limits exceed Telegram bounds, it automatically splits across multiple messages._"
     )
     
     message.reply_text(
@@ -169,6 +242,7 @@ def handle_batch_upload(client: Client, message: Message):
         f">\n"
         f"> _Target Chat ID: `{target_chat_id}`_\n"
         f"> _Total Queue Items: `{len(data_items)}`_\n"
+        f"> _Index Auto-Generation: Enabled_\n"
         f"> _Status: Running..._"
     )
     message.reply_text(start_msg)
@@ -176,9 +250,9 @@ def handle_batch_upload(client: Client, message: Message):
     try:
         process_batch(target_chat_id, data_items, bearer_token)
         complete_msg = (
-            f"> _✅ **Task Completed**_\n"
+            f"> _✅ **Batch Processing & Indexing Completed**_\n"
             f">\n"
-            f"> _All items from the batch file have been processed and uploaded successfully._"
+            f"> _All items from the batch file were uploaded and pinned, and the master index has been published._"
         )
         message.reply_text(complete_msg)
     finally:
