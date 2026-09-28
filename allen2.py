@@ -124,6 +124,11 @@ def allen_login_idpass(username, password):
     even on HTTP 200. This targets the single live endpoint and checks every
     plausible token location.
     """
+    username = str(username).strip()
+    password = str(password).strip()
+    if not username or not password:
+        raise ValueError("Username and password cannot be empty")
+
     endpoint = "https://api.allen-live.in/api/v1/auth/username"
     # Allen validates this value from the JSON body. Keep one ID for the
     # installation so the same account does not look like a new device on
@@ -194,6 +199,9 @@ def allen_login_idpass(username, password):
         return token
 
     reason = data.get("reason") or data.get("message") or res.text[:300]
+    normalized_reason = str(reason).lower()
+    if res.status_code == 400 and ("invalid username" in normalized_reason or "invalid login credentials" in normalized_reason):
+        raise ValueError("Allen rejected the username or password. Use the same credentials that currently work on Allen Digital; do not include spaces around *.")
     raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
 
 # ==========================================
@@ -286,7 +294,10 @@ async def handle_login(client: Client, message: Message):
         await message.reply_text("<blockquote><i>⚠️ Format incorrect!\nUsage: <code>/login username*password</code></i></blockquote>")
         return
 
-    username, password = args[1].strip().split("*", 1)
+    username, password = (part.strip() for part in args[1].strip().split("*", 1))
+    if not username or not password:
+        await message.reply_text("<blockquote><i>⚠️ Username and password cannot be empty.</i></blockquote>")
+        return
     status_msg = await message.reply_text("<blockquote><i>🔑 Authenticating directly with Allen Servers...</i></blockquote>")
 
     try:
