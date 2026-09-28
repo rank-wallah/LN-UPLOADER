@@ -136,8 +136,7 @@ def allen_login_idpass(username, password):
         "Content-Type": "application/json",
         "Origin": "https://allen.in",
         "Referer": "https://allen.in/",
-        "DeviceID": device_id,
-        "deviceId": device_id,
+        "X-Device-Id": device_id,
     }
     payload = {
         "username": username,
