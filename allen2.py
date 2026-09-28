@@ -82,11 +82,18 @@ def allen_headers(token):
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
         "Origin": "https://allen.in",
         "Referer": "https://allen.in/",
+        "Sec-Ch-Ua": '"Chromium";v="137", "Google Chrome";v="137", "Not/A)Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
         "X-Client-Type": "web",
         "X-Locale": "en",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
     }
 
 def fetch_student_info(token):
@@ -287,10 +294,10 @@ def _walk_page(node, contents, chapters):
             _walk_page(value, contents, chapters)
 
 
-def _course_params(batches, course_id, stream, subject_id, topic_id=None):
+def _course_params(batch_ids, selected_batches, course_id, stream, subject_id, topic_id=None):
     params = {
-        "batch_id": ",".join(batches),
-        "selected_batch_list": ",".join(batches),
+        "batch_id": ",".join(batch_ids),
+        "selected_batch_list": ",".join(selected_batches),
         "selected_course_id": course_id,
         "stream": stream,
         "subject_id": subject_id,
@@ -326,16 +333,21 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"]})
 
     for course in courses:
-        batches = list(course.get("enrolled_batches") or []) + list(course.get("unenrolled_batches") or [])
-        if not batches:
+        selected_batches = list(course.get("enrolled_batches") or []) + list(course.get("unenrolled_batches") or [])
+        if not selected_batches:
             continue
+        # Allen treats these two parameters differently: batch_id is the batch
+        # being viewed, selected_batch_list is the complete course batch list.
+        # Sending every batch in both fields makes some accounts return an empty page.
+        batch_ids = selected_batches if wants_all else [str(batch_id)]
         cname = course.get("course_name") or "Course"
         cid = course.get("course_id") or ""
         for sname, sid in ALLEN_SUBJECTS:
             if subject and sname != subject:
                 continue
             try:
-                page = allen_get_page("/subject-details?" + _course_params(batches, cid, stream, sid), token)
+                page = allen_get_page("/subject-details?" + _course_params(
+                    batch_ids, selected_batches, cid, stream, sid), token)
             except Exception as e:
                 logger.warning(f"subject {sname} skipped: {e}")
                 continue
@@ -345,7 +357,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             for ch in chapters:
                 try:
                     tpage = allen_get_page("/topic-details?" + _course_params(
-                        batches, cid, stream, ch.get("subject_id") or sid, ch["topic_id"]), token)
+                        batch_ids, selected_batches, cid, stream,
+                        ch.get("subject_id") or sid, ch["topic_id"]), token)
                 except Exception as e:
                     logger.warning(f"topic {ch.get('topic_name')} skipped: {e}")
                     continue
@@ -762,9 +775,11 @@ async def handle_debug(client: Client, message: Message):
         if want_batch:
             courses = [c for c in courses if want_batch in (c.get("enrolled_batches") or []) + (c.get("unenrolled_batches") or [])] or courses
         for c in courses[:1]:
-            batches = list(c.get("enrolled_batches") or []) + list(c.get("unenrolled_batches") or [])
+            selected_batches = list(c.get("enrolled_batches") or []) + list(c.get("unenrolled_batches") or [])
+            batch_ids = [want_batch] if want_batch else selected_batches
             for sname, sid in ALLEN_SUBJECTS:
-                page_url = "/subject-details?" + _course_params(batches, c.get("course_id") or "", stream, sid)
+                page_url = "/subject-details?" + _course_params(
+                    batch_ids, selected_batches, c.get("course_id") or "", stream, sid)
                 rr = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url}, headers=allen_headers(token), timeout=30)
                 try:
                     body = rr.json()
