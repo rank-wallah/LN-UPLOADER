@@ -346,8 +346,12 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
     if not wants_all:
         matched = [c for c in courses if batch_id in
                    (list(c.get("enrolled_batches") or []) + list(c.get("unenrolled_batches") or []))]
-        courses = matched or [{"course_id": "", "course_name": "Batch",
-                               "enrolled_batches": [batch_id], "unenrolled_batches": []}]
+        if not matched:
+            known = sum((list(c.get("enrolled_batches") or []) for c in courses), [])
+            raise ValueError(
+                "Batch ID account ke enrolled batches me nahi mila. /mybatches se ✅ wala exact ID copy karo. "
+                f"Found {len(known)} enrolled batch(es).")
+        courses = matched
 
     items, seen = [], set()
 
@@ -641,7 +645,10 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject)
         pending = [i for i in items if i["id"] not in done]
         if not items:
-            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila.\n\nKripya <code>/debug</code> bhejo aur jo file aaye wo Lovable chat me upload karo — main format fix kar dunga.</i></blockquote>")
+            await status_msg.edit_text(
+                "<blockquote><i>❌ Allen ne is course/batch ke liye empty page bheja. "
+                "Pehle <code>/login</code> dobara karein, phir <code>/mybatches</code> se ✅ enrolled "
+                "Batch ID copy karke <code>/batch &lt;ID&gt; physics</code> chalayein.</i></blockquote>")
             return
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
