@@ -131,12 +131,12 @@ def allen_content_headers(token):
 def fetch_student_info(token):
     """Fetch student profile + enrolled courses/batches from Allen Digital."""
     r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                     headers=allen_headers(token), timeout=25)
+                     headers=allen_content_headers(token), timeout=25)
     if r.status_code == 401:
         if ALLEN_USERNAME and ALLEN_PASSWORD:
             token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
             r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                             headers=allen_headers(token), timeout=25)
+                             headers=allen_content_headers(token), timeout=25)
         if r.status_code == 401:
             raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     data = r.json()
@@ -149,7 +149,7 @@ def get_or_login_allen_token(force_login=False):
     token = None if force_login else get_allen_token()
     if token:
         check = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                             headers=allen_headers(token), timeout=25)
+                             headers=allen_content_headers(token), timeout=25)
         if check.status_code != 401:
             return token
     if ALLEN_USERNAME and ALLEN_PASSWORD:
@@ -367,6 +367,59 @@ def _walk_page(node, contents, chapters):
             _walk_page(value, contents, chapters)
 
 
+def _allen_internal_urls(node, wanted_uri=None):
+    """Collect exact internal page URLs emitted by Allen's page renderer."""
+    found = []
+    if isinstance(node, dict):
+        for key in ("action", "content_action", "card_action"):
+            action = node.get(key)
+            if not isinstance(action, dict):
+                continue
+            data = action.get("data") or {}
+            uri = data.get("uri")
+            query = data.get("query")
+            if isinstance(uri, str) and uri.startswith("/"):
+                if wanted_uri is None or uri.split("?", 1)[0] == wanted_uri:
+                    if isinstance(query, dict) and query:
+                        clean = {str(k): str(v) for k, v in query.items() if v is not None}
+                        found.append(uri.split("?", 1)[0] + "?" + urlencode(clean))
+                    else:
+                        found.append(uri)
+        for value in node.values():
+            found.extend(_allen_internal_urls(value, wanted_uri))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_allen_internal_urls(value, wanted_uri))
+    return list(dict.fromkeys(found))
+
+
+def _discover_subject_urls(token):
+    """Ask Allen's own library pages for authoritative course/subject URLs."""
+    discovered, queue, visited = [], ["/library-web", "/explore"], set()
+    while queue and len(visited) < 8:
+        page_url = queue.pop(0)
+        if page_url in visited:
+            continue
+        visited.add(page_url)
+        try:
+            page = allen_get_page(page_url, token)
+        except Exception as exc:
+            logger.warning("Allen navigation discovery skipped %s: %s", page_url, exc)
+            continue
+        discovered.extend(_allen_internal_urls(page, "/subject-details"))
+        for next_url in _allen_internal_urls(page):
+            path = next_url.split("?", 1)[0]
+            if path in ("/library-web", "/library", "/explore") and next_url not in visited:
+                queue.append(next_url)
+    return list(dict.fromkeys(discovered))
+
+
+def _query_value(page_url, key):
+    from urllib.parse import parse_qs, urlsplit
+    values = parse_qs(urlsplit(page_url).query).get(key) or []
+    return values[0] if values else ""
+
+
 def _course_params(batch_ids, selected_batches, course_id, stream, subject_id,
                    topic_id=None, taxonomy_id=None):
     params = {
@@ -425,6 +478,11 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
         courses = matched
 
     items, seen = [], set()
+    # The renderer can return account-specific batch subsets that are not present
+    # as a simple enrolled/unenrolled combination. Prefer those server-generated
+    # URLs and keep constructed URLs only as compatibility fallbacks.
+    discovered_subject_urls = _discover_subject_urls(token)
+    logger.info("Allen navigation discovery found %s subject URL(s)", len(discovered_subject_urls))
 
     def _add(prefix, found):
         for it in found:
@@ -471,26 +529,45 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             contents, chapters = [], []
             working_context = None
             last_error = None
-            for taxonomy_id in _taxonomy_candidates(info, course):
-                for stream in stream_variants:
-                    for batch_ids_tuple, selected_list_tuple in batch_variants:
-                        batch_ids, selected_list = list(batch_ids_tuple), list(selected_list_tuple)
-                        try:
-                            page = allen_get_page("/subject-details?" + _course_params(
-                                batch_ids, selected_list, cid, stream, sid,
-                                taxonomy_id=taxonomy_id), token)
-                            trial_contents, trial_chapters = [], []
-                            _walk_page(page, trial_contents, trial_chapters)
-                            if trial_contents or trial_chapters:
-                                contents, chapters = trial_contents, trial_chapters
-                                working_context = (batch_ids, selected_list, taxonomy_id, stream)
-                                break
-                        except Exception as e:
-                            last_error = e
+            exact_urls = [url for url in discovered_subject_urls
+                          if _query_value(url, "selected_course_id") == str(cid)
+                          and _query_value(url, "subject_id") == str(sid)]
+            if not wants_all:
+                exact_urls = [url for url in exact_urls if str(batch_id) in
+                              (_query_value(url, "batch_id") + "," +
+                               _query_value(url, "selected_batch_list")).split(",")]
+            for page_url in exact_urls:
+                try:
+                    page = allen_get_page(page_url, token)
+                    trial_contents, trial_chapters = [], []
+                    _walk_page(page, trial_contents, trial_chapters)
+                    if trial_contents or trial_chapters:
+                        contents, chapters = trial_contents, trial_chapters
+                        working_context = ([], [], "", "")
+                        break
+                except Exception as e:
+                    last_error = e
+            if not working_context:
+                for taxonomy_id in _taxonomy_candidates(info, course):
+                    for stream in stream_variants:
+                        for batch_ids_tuple, selected_list_tuple in batch_variants:
+                            batch_ids, selected_list = list(batch_ids_tuple), list(selected_list_tuple)
+                            try:
+                                page = allen_get_page("/subject-details?" + _course_params(
+                                    batch_ids, selected_list, cid, stream, sid,
+                                    taxonomy_id=taxonomy_id), token)
+                                trial_contents, trial_chapters = [], []
+                                _walk_page(page, trial_contents, trial_chapters)
+                                if trial_contents or trial_chapters:
+                                    contents, chapters = trial_contents, trial_chapters
+                                    working_context = (batch_ids, selected_list, taxonomy_id, stream)
+                                    break
+                            except Exception as e:
+                                last_error = e
+                        if working_context:
+                            break
                     if working_context:
                         break
-                if working_context:
-                    break
             if not working_context:
                 logger.warning(f"subject {sname} returned no chapters/content: {last_error or 'empty page'}")
                 continue
@@ -746,8 +823,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         pending = [i for i in items if i["id"] not in done]
         if not items:
             await status_msg.edit_text(
-                "<blockquote><i>❌ Allen ne is course/batch ke liye empty page bheja. "
-                "Login/session valid hai; course mapping ka diagnostic server log me save hua hai.</i></blockquote>")
+                "<blockquote><i>❌ Allen library me is batch/subject ka lecture link nahi mila. "
+                "Login/session valid hai—dobara login mat karein. ✅ Batch ID ko <code>/mybatches</code> se check karein.</i></blockquote>")
             return
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
@@ -923,13 +1000,14 @@ async def handle_debug(client: Client, message: Message):
     status = await message.reply_text("<blockquote><i>🔍 Debug data collect ho raha hai...</i></blockquote>")
 
     def _collect():
-        out = {"student_info": None, "pages": []}
-        r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo", headers=allen_headers(token), timeout=25)
+        out = {"student_info": None, "navigation_subject_urls": [], "pages": []}
+        r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo", headers=allen_content_headers(token), timeout=25)
         try:
             info = r.json()
         except Exception:
             info = {"raw": r.text[:2000]}
         out["student_info"] = {"http": r.status_code, "body": info}
+        out["navigation_subject_urls"] = _discover_subject_urls(token)
         data = (info or {}).get("data") or {}
         stream = (data.get("student_detail") or {}).get("stream") or ""
         courses = data.get("course_details") or []
