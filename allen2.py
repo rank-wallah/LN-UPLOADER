@@ -78,6 +78,28 @@ def get_allen_token():
     session = get_allen_session()
     return session.get("access_token") or session.get("token")
 
+def allen_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Origin": "https://allen.in",
+        "Referer": "https://allen.in/",
+        "X-Client-Type": "web",
+        "X-Locale": "en",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+def fetch_student_info(token):
+    """Fetch student profile + enrolled courses/batches from Allen Digital."""
+    r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
+                     headers=allen_headers(token), timeout=25)
+    if r.status_code == 401:
+        raise ValueError("Session expire ho gaya. /login ya /token se dobara login karo.")
+    data = r.json()
+    if data.get("status") != 200 or not data.get("data"):
+        raise ValueError(f"Allen error: {data.get('reason') or r.text[:150]}")
+    return data["data"]
+
 app = Client(
     "allen_downloader_bot",
     api_id=TG_API_ID,
@@ -266,7 +288,7 @@ async def handle_login(client: Client, message: Message):
 
     try:
         token = await asyncio.to_thread(allen_login_idpass, username, password)
-        await status_msg.edit_text("<blockquote><i>🎉 <b>Login Successful! Session Saved.</b>\n\nNow run: <code>/batch &lt;BATCH_ID&gt;</code></i></blockquote>")
+        await status_msg.edit_text("<blockquote><i>🎉 <b>Login Successful! Session Saved.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
     except Exception as e:
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
@@ -311,10 +333,49 @@ async def handle_token(client: Client, message: Message):
         session = {"access_token": token, "token": token, "username": "token-login",
                    "refresh_token": "", "host": "api.allen-live.in"}
         save_allen_session(session)
-        await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/batch &lt;BATCH_ID&gt;</code></i></blockquote>")
+        await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
     except Exception as e:
         logger.error(f"Token save failed: {e}")
         await message.reply_text(f"<blockquote><i>❌ <b>Token Error:</b> <code>{str(e)}</code></i></blockquote>")
+
+
+@app.on_message(filters.command("mybatches") & (filters.group | filters.channel | filters.private))
+async def handle_mybatches(client: Client, message: Message):
+    logger.info(f"/mybatches triggered by {message.from_user.id if message.from_user else 'Unknown'}")
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
+        return
+
+    token = get_allen_token()
+    if not token:
+        await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPlease run <code>/login username*password</code> first.</i></blockquote>")
+        return
+
+    status_msg = await message.reply_text("<blockquote><i>🔄 <b>Fetching your purchased batches...</b></i></blockquote>")
+    try:
+        info = await asyncio.to_thread(fetch_student_info, token)
+        student = info.get("student_detail") or {}
+        courses = info.get("course_details") or []
+        if not courses:
+            await status_msg.edit_text("<blockquote><i>❌ Is account me koi course/batch nahi mila.</i></blockquote>")
+            return
+        lines = [f"👤 <b>{student.get('first_name','')} {student.get('last_name','')}</b> ({student.get('stream_display_name','')})\n"]
+        for c in courses:
+            lines.append(f"📚 <b>{c.get('course_name','Course')}</b> (Course ID: <code>{c.get('course_id')}</code>)")
+            lines.append(f"   🗓 {c.get('start_date','?')} → {c.get('end_date','?')} | Session: {c.get('session','?')}")
+            for b in c.get("enrolled_batches") or []:
+                lines.append(f"   ✅ Batch ID: <code>{b}</code>")
+            for b in c.get("unenrolled_batches") or []:
+                lines.append(f"   ➖ (unenrolled) <code>{b}</code>")
+            lines.append("")
+        lines.append("Download ke liye: <code>/batch &lt;BATCH_ID&gt;</code>")
+        text = "\n".join(lines)
+        if len(text) > MAX_TG_MSG_LEN:
+            text = text[:MAX_TG_MSG_LEN] + "\n... (truncated)"
+        await status_msg.edit_text(f"<blockquote>{text}</blockquote>")
+    except Exception as e:
+        logger.error(f"/mybatches failed: {e}")
+        await status_msg.edit_text(f"<blockquote><i>❌ <b>Error:</b> <code>{str(e)}</code></i></blockquote>")
 
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
