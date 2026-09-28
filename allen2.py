@@ -294,18 +294,41 @@ def _walk_page(node, contents, chapters):
             _walk_page(value, contents, chapters)
 
 
-def _course_params(batch_ids, selected_batches, course_id, stream, subject_id, topic_id=None):
+def _course_params(batch_ids, selected_batches, course_id, stream, subject_id,
+                   topic_id=None, taxonomy_id=None):
     params = {
         "batch_id": ",".join(batch_ids),
         "selected_batch_list": ",".join(selected_batches),
         "selected_course_id": course_id,
         "stream": stream,
         "subject_id": subject_id,
-        "taxonomy_id": ALLEN_TAXONOMY,
+        "taxonomy_id": taxonomy_id or ALLEN_TAXONOMY,
     }
     if topic_id:
         params["topic_id"] = topic_id
     return urlencode(params)
+
+
+def _taxonomy_candidates(info, course):
+    """Return account/course taxonomy IDs, with the known web value as fallback."""
+    found = []
+
+    def scan(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).lower().replace("_", "") in ("taxonomy", "taxonomyid"):
+                    if child and isinstance(child, (str, int)):
+                        found.append(str(child))
+                elif isinstance(child, (dict, list)):
+                    scan(child)
+        elif isinstance(value, list):
+            for child in value:
+                scan(child)
+
+    scan(course)
+    scan(info.get("student_detail") or {})
+    found.extend([ALLEN_TAXONOMY, "1739171216OJ"])
+    return list(dict.fromkeys(v for v in found if v))
 
 
 def fetch_batch_contents(batch_id=None, token=None, subject=None):
@@ -336,29 +359,47 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
         selected_batches = list(course.get("enrolled_batches") or []) + list(course.get("unenrolled_batches") or [])
         if not selected_batches:
             continue
-        # Allen treats these two parameters differently: batch_id is the batch
-        # being viewed, selected_batch_list is the complete course batch list.
-        # Sending every batch in both fields makes some accounts return an empty page.
-        batch_ids = selected_batches if wants_all else [str(batch_id)]
+        # Allen's web client normally sends the complete course batch list in BOTH
+        # fields.  Some accounts accept only the chosen batch, so that is a fallback.
+        batch_variants = [(selected_batches, selected_batches)]
+        if not wants_all:
+            chosen = [str(batch_id)]
+            batch_variants.append((chosen, selected_batches))
+            batch_variants.append((chosen, chosen))
         cname = course.get("course_name") or "Course"
         cid = course.get("course_id") or ""
         for sname, sid in ALLEN_SUBJECTS:
             if subject and sname != subject:
                 continue
-            try:
-                page = allen_get_page("/subject-details?" + _course_params(
-                    batch_ids, selected_batches, cid, stream, sid), token)
-            except Exception as e:
-                logger.warning(f"subject {sname} skipped: {e}")
-                continue
             contents, chapters = [], []
-            _walk_page(page, contents, chapters)
+            working_context = None
+            last_error = None
+            for taxonomy_id in _taxonomy_candidates(info, course):
+                for batch_ids, selected_list in batch_variants:
+                    try:
+                        page = allen_get_page("/subject-details?" + _course_params(
+                            batch_ids, selected_list, cid, stream, sid,
+                            taxonomy_id=taxonomy_id), token)
+                        trial_contents, trial_chapters = [], []
+                        _walk_page(page, trial_contents, trial_chapters)
+                        if trial_contents or trial_chapters:
+                            contents, chapters = trial_contents, trial_chapters
+                            working_context = (batch_ids, selected_list, taxonomy_id)
+                            break
+                    except Exception as e:
+                        last_error = e
+                if working_context:
+                    break
+            if not working_context:
+                logger.warning(f"subject {sname} returned no chapters/content: {last_error or 'empty page'}")
+                continue
             _add(f"[{cname} | {sname}]", contents)
+            batch_ids, selected_list, taxonomy_id = working_context
             for ch in chapters:
                 try:
                     tpage = allen_get_page("/topic-details?" + _course_params(
-                        batch_ids, selected_batches, cid, stream,
-                        ch.get("subject_id") or sid, ch["topic_id"]), token)
+                        batch_ids, selected_list, cid, stream,
+                        ch.get("subject_id") or sid, ch["topic_id"], taxonomy_id), token)
                 except Exception as e:
                     logger.warning(f"topic {ch.get('topic_name')} skipped: {e}")
                     continue
