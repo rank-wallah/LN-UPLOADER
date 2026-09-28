@@ -117,142 +117,69 @@ def _host_resolves(url):
 
 
 def allen_login_idpass(username, password):
-    """Attempt multiple payload/header permutations to satisfy Allen API DeviceID requirement.
+    """Authenticate against Allen's live API and return an access token.
 
-    Strategy:
-    - Skip endpoints that fail DNS resolution quickly.
-    - Try multiple username key spellings and device id key/header spellings.
-    - Try JSON, form-encoded, and query-param modes.
-    - Log request/response details for debugging.
+    Allen responds with {"status":200,"data":{"access_token":"...","refresh_token":"..."}}.
+    The old code missed the nested access_token and reported "Login failed"
+    even on HTTP 200. This targets the single live endpoint and checks every
+    plausible token location.
     """
-    login_endpoints = [
-        "https://api.allen-live.in/api/v1/auth/username",
-        "https://api.allen.in/v1/auth/login",
-        "https://api.allen.ac.in/v1/auth/login"
-    ]
-
+    endpoint = "https://api.allen-live.in/api/v1/auth/username"
     device_id = str(uuid.uuid4())
 
-    username_keys = ["username", "userName", "user_name", "user"]
-    device_body_keys = ["DeviceID", "deviceId", "device_id", "deviceid"]
-    device_header_keys = ["DeviceID", "device-id", "deviceId", "deviceid", "X-Device-Id", "x-device-id"]
-
-    base_headers = {
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
         "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/"
+        "Referer": "https://api.allen.in/",
+        "DeviceID": device_id,
+        "deviceId": device_id,
+    }
+    payload = {
+        "username": username,
+        "password": password,
+        "grant_type": "password",
+        "DeviceID": device_id,
     }
 
-    error_log = []
+    try:
+        res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
+    except Exception as e:
+        raise ValueError(f"Network error contacting Allen: {e}")
 
-    for endpoint in login_endpoints:
-        if not _host_resolves(endpoint):
-            logger.warning(f"Skipping {endpoint} — DNS lookup failed")
-            error_log.append(f"[{endpoint.split('//')[1].split('/')[0]}] DNS lookup failed")
-            continue
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
 
-        logger.info(f"Trying endpoint {endpoint} (device_id={device_id})")
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    token = (
+        data.get("access_token")
+        or data.get("token")
+        or inner.get("access_token")
+        or inner.get("token")
+        or inner.get("accessToken")
+    )
+    refresh = (
+        data.get("refresh_token")
+        or inner.get("refresh_token")
+        or inner.get("refreshToken")
+    )
 
-        # build base payload entries (we will vary keys)
-        for uname_key in username_keys:
-            for dev_key in device_body_keys:
-                payload = {uname_key: username, "password": password, "grant_type": "password", dev_key: device_id}
+    if res.status_code == 200 and token:
+        save_allen_session({
+            "username": username,
+            "access_token": token,
+            "refresh_token": refresh,
+            "device_id": device_id,
+            "login_time": time.time(),
+        })
+        logger.info("Allen login successful")
+        return token
 
-                # Try JSON mode
-                headers = {**base_headers, "Content-Type": "application/json"}
-                # include some device headers too
-                for hk in device_header_keys[:2]:
-                    headers[hk] = device_id
-
-                try:
-                    res = requests.post(endpoint, json=payload, headers=headers, timeout=15)
-                    logger.debug(f"POST JSON -> {endpoint} sent headers: {headers}")
-                    logger.debug(f"POST JSON -> body: {json.dumps(payload)}")
-                except Exception as e:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] JSON request failed: {e}"
-                    error_log.append(err)
-                    logger.warning(err)
-                    res = None
-
-                if res is not None and res.status_code == 200:
-                    try:
-                        data = res.json()
-                    except Exception:
-                        data = {}
-                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
-                    if token:
-                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                        logger.info(f"Auth successful on {endpoint} (json, keys: {uname_key}/{dev_key})")
-                        return token
-                    else:
-                        logger.debug(f"200 but no token in response: {res.text}")
-
-                if res is not None:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] JSON HTTP {res.status_code}: {res.text[:300]}"
-                    error_log.append(err)
-
-                # Try form-encoded mode
-                headers2 = {**base_headers, "Content-Type": "application/x-www-form-urlencoded"}
-                for hk in device_header_keys[:3]:
-                    headers2[hk] = device_id
-                try:
-                    res2 = requests.post(endpoint, data=payload, headers=headers2, timeout=15)
-                    logger.debug(f"POST FORM -> {endpoint} sent headers: {headers2}")
-                    logger.debug(f"POST FORM -> body: {payload}")
-                except Exception as e:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] FORM request failed: {e}"
-                    error_log.append(err)
-                    logger.warning(err)
-                    res2 = None
-
-                if res2 is not None and res2.status_code == 200:
-                    try:
-                        data = res2.json()
-                    except Exception:
-                        data = {}
-                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
-                    if token:
-                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                        logger.info(f"Auth successful on {endpoint} (form, keys: {uname_key}/{dev_key})")
-                        return token
-                    else:
-                        logger.debug(f"200 but no token in form response: {res2.text}")
-
-                if res2 is not None:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] FORM HTTP {res2.status_code}: {res2.text[:300]}"
-                    error_log.append(err)
-
-                # Try params mode (device in query)
-                headers3 = {k: v for k, v in base_headers.items()}
-                try:
-                    res3 = requests.post(endpoint, json={"username": username, "password": password}, headers=headers3, params={"device_id": device_id}, timeout=15)
-                    logger.debug(f"POST PARAMS -> {endpoint} url: {res3.url}")
-                except Exception as e:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] PARAMS request failed: {e}"
-                    error_log.append(err)
-                    logger.warning(err)
-                    res3 = None
-
-                if res3 is not None and res3.status_code == 200:
-                    try:
-                        data = res3.json()
-                    except Exception:
-                        data = {}
-                    token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
-                    if token:
-                        save_allen_session({"username": username, "token": token, "login_time": time.time()})
-                        logger.info(f"Auth successful on {endpoint} (params, keys: {uname_key}/{dev_key})")
-                        return token
-                    else:
-                        logger.debug(f"200 but no token in params response: {res3.text}")
-
-                if res3 is not None:
-                    err = f"[{endpoint.split('//')[1].split('/')[0]}] PARAMS HTTP {res3.status_code}: {res3.text[:300]}"
-                    error_log.append(err)
-
-    combined_errors = "\n".join(error_log)
-    raise ValueError(f"Login failed across all endpoints:\n{combined_errors}")
+    reason = data.get("reason") or data.get("message") or res.text[:300]
+    raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
 
 # ==========================================
 # HIGH SPEED DOWNLOAD & UPLOAD ENGINE
