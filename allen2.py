@@ -574,7 +574,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject)
         pending = [i for i in items if i["id"] not in done]
         if not items:
-            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila. <code>/mybatches</code> chalao.</i></blockquote>")
+            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila.\n\nKripya <code>/debug</code> bhejo aur jo file aaye wo Lovable chat me upload karo — main format fix kar dunga.</i></blockquote>")
             return
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
@@ -733,6 +733,62 @@ async def handle_subjects(client: Client, message: Message):
         "<code>/batch &lt;BATCH_ID&gt; physics -c -100xxxxxxxxxx</code>\n"
         "(Bot ko us channel me admin banao. Alag-alag batches alag channels me ek saath chal sakte hain.)\n\n"
         "<code>/jobs</code> — chal rahe kaam dekho | <code>/stop</code> — sab rok do</i></blockquote>")
+
+
+@app.on_message(filters.command("debug") & (filters.group | filters.channel | filters.private))
+async def handle_debug(client: Client, message: Message):
+    """Dump raw Allen responses into a file so the content format can be fixed."""
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        return
+    token = get_allen_token()
+    if not token:
+        await message.reply_text("<blockquote><i>⚠️ Pehle /login ya /token karo.</i></blockquote>")
+        return
+    parts = (message.text or "").split()[1:]
+    want_batch = parts[0] if parts else None
+    status = await message.reply_text("<blockquote><i>🔍 Debug data collect ho raha hai...</i></blockquote>")
+
+    def _collect():
+        out = {"student_info": None, "pages": []}
+        r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo", headers=allen_headers(token), timeout=25)
+        try:
+            info = r.json()
+        except Exception:
+            info = {"raw": r.text[:2000]}
+        out["student_info"] = {"http": r.status_code, "body": info}
+        data = (info or {}).get("data") or {}
+        stream = (data.get("student_detail") or {}).get("stream") or ""
+        courses = data.get("course_details") or []
+        if want_batch:
+            courses = [c for c in courses if want_batch in (c.get("enrolled_batches") or []) + (c.get("unenrolled_batches") or [])] or courses
+        for c in courses[:1]:
+            batches = list(c.get("enrolled_batches") or []) + list(c.get("unenrolled_batches") or [])
+            for sname, sid in ALLEN_SUBJECTS:
+                page_url = "/subject-details?" + _course_params(batches, c.get("course_id") or "", stream, sid)
+                rr = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url}, headers=allen_headers(token), timeout=30)
+                try:
+                    body = rr.json()
+                except Exception:
+                    body = {"raw": rr.text[:3000]}
+                out["pages"].append({"subject": sname, "page_url": page_url, "http": rr.status_code, "body": body})
+        return out
+
+    try:
+        out = await asyncio.to_thread(_collect)
+        txt = json.dumps(out, indent=1, ensure_ascii=False).replace(token, "<TOKEN>")
+        # strip personal info
+        for f in ("email", "phone", "dob"):
+            txt = __import__("re").sub(rf'"{f}": "[^"]*"', f'"{f}": "***"', txt)
+        path = os.path.join(DOWNLOAD_DIR, "allen_debug.json")
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(txt)
+        summary = "\n".join(f"{pg['subject']}: HTTP {pg['http']} | {str((pg['body'] or {}).get('reason',''))[:60]}" for pg in out["pages"]) or "No course found"
+        await message.reply_document(path, caption=f"<blockquote><i>🧪 Debug file\n{summary}\n\nYe file Lovable chat me bhejo.</i></blockquote>")
+        await status.delete()
+        os.remove(path)
+    except Exception as e:
+        await status.edit_text(f"<blockquote><i>❌ Debug error: <code>{str(e)[:300]}</code></i></blockquote>")
 
 
 @app.on_message(filters.command("jobs"))
