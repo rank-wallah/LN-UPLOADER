@@ -89,7 +89,7 @@ app = Client(
 
 ACTIVE_JOBS = {}
 MAX_TG_MSG_LEN = 4000
-ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
+ALLEN_BASE_URL = "https://live.allenbpms.in/api"
 
 def cleanup_workspace():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -117,56 +117,32 @@ def _host_resolves(url):
 
 
 def allen_login_idpass(username, password):
-    """Authenticate against Allen's live API and return an access token.
+    """Authenticate against ALLEN BPMS (Impartus) and return an access token.
 
-    Allen responds with {"status":200,"data":{"access_token":"...","refresh_token":"..."}}.
-    The old code missed the nested access_token and reported "Login failed"
-    even on HTTP 200. This targets the single live endpoint and checks every
-    plausible token location.
+    Correct endpoint discovered from the live.allenbpms.in login app:
+    POST https://live.allenbpms.in/api/auth/signin  {"username": ..., "password": ...}
+    Failure:  {"success": false, "message": "no-such-user" | "incorrect-password"}
+    Success:  {"success": true, "data": {"token": "...", ...}}
     """
     username = str(username).strip()
     password = str(password).strip()
     if not username or not password:
         raise ValueError("Username and password cannot be empty")
 
-    endpoint = "https://api.allen-live.in/api/v1/auth/username"
-    # Allen validates this value from the JSON body. Keep one ID for the
-    # installation so the same account does not look like a new device on
-    # every login, and send all field spellings used by its web/mobile APIs.
-    previous_session = get_allen_session()
-    device_id = previous_session.get("device_id") or str(uuid.uuid4())
-
+    endpoint = "https://live.allenbpms.in/api/auth/signin"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "Origin": "https://api.allen.in",
-        "Referer": "https://api.allen.in/",
-        "DeviceID": device_id,
-        "device-id": device_id,
-        "X-Device-Id": device_id,
-        "device_id": device_id,
+        "Origin": "https://live.allenbpms.in",
+        "Referer": "https://live.allenbpms.in/login/",
     }
-    payload = {
-        "username": username,
-        "password": password,
-        "grant_type": "password",
-        "DeviceID": device_id,
-        "deviceId": device_id,
-        "device_id": device_id,
-        "deviceid": device_id,
-    }
+    payload = {"username": username, "password": password}
 
     try:
-        res = requests.post(
-            endpoint,
-            json=payload,
-            headers=headers,
-            params={"device_id": device_id},
-            timeout=20,
-        )
+        res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
     except Exception as e:
-        raise ValueError(f"Network error contacting Allen: {e}")
+        raise ValueError(f"Network error contacting Allen BPMS: {e}")
 
     try:
         data = res.json()
@@ -175,38 +151,28 @@ def allen_login_idpass(username, password):
 
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
     token = (
-        data.get("access_token")
-        or data.get("token")
-        or inner.get("access_token")
+        data.get("token")
+        or data.get("access_token")
         or inner.get("token")
+        or inner.get("access_token")
         or inner.get("accessToken")
-    )
-    refresh = (
-        data.get("refresh_token")
-        or inner.get("refresh_token")
-        or inner.get("refreshToken")
     )
 
     if res.status_code == 200 and token:
-        save_allen_session({
-            "username": username,
+        session = {
             "access_token": token,
-            "refresh_token": refresh,
-            "device_id": device_id,
-            "login_time": time.time(),
-        })
-        logger.info("Allen login successful")
+            "token": token,
+            "username": username,
+            "login_at": int(time.time()),
+        }
+        if isinstance(data.get("data"), dict):
+            session["user"] = data["data"]
+        save_allen_session(session)
         return token
 
-    reason = data.get("reason") or data.get("message") or res.text[:300]
-    normalized_reason = str(reason).lower()
-    if res.status_code == 400 and ("invalid username" in normalized_reason or "invalid login credentials" in normalized_reason):
-        raise ValueError("Allen rejected the username or password. Use the same credentials that currently work on Allen Digital; do not include spaces around *.")
+    reason = data.get("message") or data.get("reason") or res.text[:200]
     raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
 
-# ==========================================
-# HIGH SPEED DOWNLOAD & UPLOAD ENGINE
-# ==========================================
 
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
