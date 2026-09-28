@@ -327,8 +327,8 @@ def allen_get_page(page_url, token):
                if isinstance(page_data, dict) else None)
     if not widgets:
         logger.warning(
-            "Allen empty page: http=%s reason=%s path=%s data_keys=%s",
-            r.status_code, data.get("reason"), page_url.split("?", 1)[0],
+            "Allen empty page: http=%s status=%s reason=%s page_url=%s data_keys=%s",
+            r.status_code, data.get("status"), data.get("reason"), page_url,
             list(page_data.keys()) if isinstance(page_data, dict) else [])
     return page_data
 
@@ -384,7 +384,8 @@ def _course_params(batch_ids, selected_batches, course_id, stream, subject_id,
 
 def _taxonomy_candidates(info, course):
     """Return account/course taxonomy IDs, with the known web value as fallback."""
-    found = []
+    # Try the known working web taxonomy before any optional account metadata.
+    found = [ALLEN_TAXONOMY, "1739171216OJ"]
 
     def scan(value):
         if isinstance(value, dict):
@@ -400,7 +401,6 @@ def _taxonomy_candidates(info, course):
 
     scan(course)
     scan(info.get("student_detail") or {})
-    found.extend([ALLEN_TAXONOMY, "1739171216OJ"])
     return list(dict.fromkeys(v for v in found if v))
 
 
