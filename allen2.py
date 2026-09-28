@@ -116,60 +116,57 @@ def _host_resolves(url):
         return False
 
 
-FIREBASE_API_KEY = "AIzaSyCXje_o8MeFX0hLAo9iMOlCMEFwgJO0kpI"
-FIREBASE_SIGNIN_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
-
 def allen_login_idpass(username, password):
-    """Authenticate via ALLEN Digital (allen.in) Firebase Auth.
+    """Authenticate via ALLEN Digital API (api.allen-live.in).
 
-    allen.in uses Firebase (project allen-digital-55). The API key is
-    referer-restricted, so the Referer header is required.
-    Success returns a Firebase idToken which is saved as the session token.
+    Endpoint: POST /api/v1/auth/username
+    Requires a DeviceID (uuid) in both header and payload.
+    Success: {"status":200,"data":{"access_token":...,"refresh_token":...}}
     """
     username = str(username).strip()
     password = str(password).strip()
     if not username or not password:
         raise ValueError("Username and password cannot be empty")
 
-    # allen.in logins are email-based; mobile numbers map to <number>@allen.in
-    if "@" in username:
-        candidates = [username]
-    else:
-        candidates = [f"{username}@allen.in", f"91{username}@allen.in"]
-
+    device_id = str(uuid.uuid4())
+    url = "https://api.allen-live.in/api/v1/auth/username"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Referer": "https://allen.in",
         "Origin": "https://allen.in",
+        "Referer": "https://allen.in/",
+        "DeviceID": device_id,
+        "deviceId": device_id,
     }
-    errors = []
-    for email in candidates:
-        payload = {"email": email, "password": password, "returnSecureToken": True}
-        try:
-            res = requests.post(f"{FIREBASE_SIGNIN_URL}?key={FIREBASE_API_KEY}",
-                                json=payload, headers=headers, timeout=20)
-        except Exception as e:
-            errors.append(f"network error {e}")
-            continue
-        try:
-            data = res.json()
-        except Exception:
-            data = {}
-        token = data.get("idToken")
-        if res.status_code == 200 and token:
-            global ALLEN_BASE_URL
-            ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
-            session = {"access_token": token, "token": token,
-                       "refresh_token": data.get("refreshToken", ""),
-                       "username": email, "uid": data.get("localId", ""),
-                       "host": "api.allen-live.in", "login_at": int(time.time())}
-            save_allen_session(session)
-            return token
-        reason = (data.get("error") or {}).get("message") or res.text[:200]
-        errors.append(f"{email} (HTTP {res.status_code}): {reason}")
-    raise ValueError("Login failed -> " + " | ".join(errors))
+    payload = {
+        "username": username,
+        "password": password,
+        "grant_type": "password",
+        "DeviceID": device_id,
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=20)
+    except Exception as e:
+        raise ValueError(f"Login failed (network error): {e}")
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
+    inner = data.get("data") or {}
+    token = (data.get("access_token") or data.get("token")
+             or inner.get("access_token") or inner.get("token") or inner.get("accessToken"))
+    if res.status_code == 200 and token:
+        global ALLEN_BASE_URL
+        ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
+        session = {"access_token": token, "token": token,
+                   "refresh_token": data.get("refresh_token") or inner.get("refresh_token") or inner.get("refreshToken") or "",
+                   "username": username, "host": "api.allen-live.in",
+                   "login_at": int(time.time())}
+        save_allen_session(session)
+        return token
+    reason = data.get("reason") or data.get("message") or res.text[:200]
+    raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
 
 
 
