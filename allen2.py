@@ -266,6 +266,51 @@ async def handle_login(client: Client, message: Message):
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
 
+
+@app.on_message(filters.command("token") & (filters.group | filters.channel | filters.private))
+async def handle_token(client: Client, message: Message):
+    user_id = message.from_user.id if message.from_user else "Unknown"
+    logger.info(f"/token triggered by {user_id}")
+
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        await message.reply_text("<blockquote><i>🚫 Access Denied. Contact Admin.</i></blockquote>")
+        return
+
+    if not message.text:
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/token &lt;ALLEN_JWT_TOKEN&gt;</code></i></blockquote>")
+        return
+
+    token = args[1].strip()
+    if token.count(".") != 2:
+        await message.reply_text("<blockquote><i>⚠️ Ye valid JWT token nahi lagta. Poora token paste karo.</i></blockquote>")
+        return
+
+    try:
+        # validate token against Allen API before saving
+        def _check():
+            r = requests.put(
+                "https://api.allen-live.in/api/v1/user/profile",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={}, timeout=20,
+            )
+            return r
+        r = await asyncio.to_thread(_check)
+        if r.status_code == 401:
+            await message.reply_text("<blockquote><i>❌ Token invalid ya expire ho chuka hai. Naya token nikaalo.</i></blockquote>")
+            return
+
+        session = {"access_token": token, "token": token, "username": "token-login",
+                   "refresh_token": "", "host": "api.allen-live.in"}
+        save_allen_session(session)
+        await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/batch &lt;BATCH_ID&gt;</code></i></blockquote>")
+    except Exception as e:
+        logger.error(f"Token save failed: {e}")
+        await message.reply_text(f"<blockquote><i>❌ <b>Token Error:</b> <code>{str(e)}</code></i></blockquote>")
+
 @app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
     logger.info(f"/batch triggered by {message.from_user.id if message.from_user else 'Unknown'}")
