@@ -590,7 +590,18 @@ async def handle_login(client: Client, message: Message):
 
     try:
         token = await asyncio.to_thread(allen_login_idpass, username, password)
-        await status_msg.edit_text("<blockquote><i>🎉 <b>Login Successful! Session Saved.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
+        await status_msg.edit_text("<blockquote><i>🔎 Login successful. Ab actual lectures verify ho rahe hain...</i></blockquote>")
+        sample = await asyncio.to_thread(fetch_batch_contents, None, token, "Physics")
+        if not sample:
+            await status_msg.edit_text(
+                "<blockquote><i>⚠️ <b>Login valid hai, lekin Allen ne lecture page empty bheja.</b>\n"
+                "Session save ho gaya; dobara login karne ki zarurat nahi. "
+                "Course mapping abhi match nahi hui.</i></blockquote>")
+            return
+        await status_msg.edit_text(
+            f"<blockquote><i>🎉 <b>Login + Lecture Test Successful!</b>\n\n"
+            f"✅ {len(sample)} Physics items mile. Session saved hai.\n"
+            "Ab <code>/mybatches</code> ya <code>/batch &lt;ID&gt; physics</code> chalao.</i></blockquote>")
     except Exception as e:
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
@@ -960,6 +971,13 @@ def main():
 
     logger.info("Initializing workspace cleanup...")
     cleanup_workspace()
+    if ALLEN_USERNAME and ALLEN_PASSWORD:
+        try:
+            token = get_or_login_allen_token()
+            sample = fetch_batch_contents(None, token, "Physics")
+            logger.info("Allen startup check passed: %s Physics items found", len(sample))
+        except Exception as e:
+            logger.error("Allen startup check failed: %s", e)
     logger.info("Workspace clean. Booting Pyrogram engine...")
     app.run()
 
