@@ -26,6 +26,9 @@ TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "6789039689"))
+ALLEN_USERNAME = os.getenv("ALLEN_USERNAME", "").strip()
+ALLEN_PASSWORD = os.getenv("ALLEN_PASSWORD", "").strip()
+ALLEN_ACCESS_TOKEN = os.getenv("ALLEN_ACCESS_TOKEN", "").strip()
 
 if not TG_BOT_TOKEN:
     logger.warning("TG_BOT_TOKEN is empty! Pyrogram will hang in CMD waiting for manual input.")
@@ -33,6 +36,7 @@ if not TG_BOT_TOKEN:
 AUTH_FILE = "authorized_users.json"
 SESSION_FILE = "allen_session.json"
 DOWNLOAD_DIR = "./downloads"
+RUNTIME_ALLEN_TOKEN = ""
 
 def load_authorized_users():
     if os.path.exists(AUTH_FILE):
@@ -75,15 +79,18 @@ def get_allen_session():
     return {}
 
 def get_allen_token():
+    if RUNTIME_ALLEN_TOKEN:
+        return RUNTIME_ALLEN_TOKEN
     session = get_allen_session()
-    return session.get("access_token") or session.get("token")
+    return session.get("access_token") or session.get("token") or ALLEN_ACCESS_TOKEN
 
 def get_allen_device_id():
     """Use one stable device identity for login and every authenticated request."""
     session = get_allen_session()
-    device_id = session.get("device_id")
+    device_id = session.get("device_id") or os.getenv("ALLEN_DEVICE_ID", "").strip()
     if not device_id:
-        device_id = str(uuid.uuid4())
+        # Stable across Heroku deploys without exposing the bot token itself.
+        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"allen-bot:{TG_BOT_TOKEN}"))
         session["device_id"] = device_id
         save_allen_session(session)
     return device_id
@@ -114,11 +121,30 @@ def fetch_student_info(token):
     r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
                      headers=allen_headers(token), timeout=25)
     if r.status_code == 401:
-        raise ValueError("Session expire ho gaya. /login ya /token se dobara login karo.")
+        if ALLEN_USERNAME and ALLEN_PASSWORD:
+            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
+            r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
+                             headers=allen_headers(token), timeout=25)
+        if r.status_code == 401:
+            raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     data = r.json()
     if data.get("status") != 200 or not data.get("data"):
         raise ValueError(f"Allen error: {data.get('reason') or r.text[:150]}")
     return data["data"]
+
+def get_or_login_allen_token(force_login=False):
+    """Restore a configured token, or sign in automatically after a restart/expiry."""
+    token = None if force_login else get_allen_token()
+    if token:
+        check = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
+                             headers=allen_headers(token), timeout=25)
+        if check.status_code != 401:
+            return token
+    if ALLEN_USERNAME and ALLEN_PASSWORD:
+        return allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
+    raise ValueError(
+        "Allen session saved nahi hai. Permanent login ke liye Heroku Config Vars me "
+        "ALLEN_USERNAME aur ALLEN_PASSWORD set karo, phir redeploy karo.")
 
 app = Client(
     "allen_downloader_bot",
@@ -202,8 +228,9 @@ def allen_login_idpass(username, password):
     refresh = (data.get("refresh_token") or inner.get("refresh_token") or inner.get("refreshToken")
                or res.headers.get("X-REFRESH-TOKEN") or res.headers.get("x-refresh-token") or "")
     if res.status_code == 200 and token:
-        global ALLEN_BASE_URL
+        global ALLEN_BASE_URL, RUNTIME_ALLEN_TOKEN
         ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
+        RUNTIME_ALLEN_TOKEN = token
         session = {"access_token": token, "token": token,
                    "refresh_token": refresh,
                    "device_id": device_id,
@@ -271,7 +298,12 @@ def allen_get_page(page_url, token):
     r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
                       headers=allen_headers(token), timeout=30)
     if r.status_code == 401:
-        raise ValueError("Session expire ho gaya. /login ya /token se dobara login karo.")
+        if ALLEN_USERNAME and ALLEN_PASSWORD:
+            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
+            r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
+                              headers=allen_headers(token), timeout=30)
+        if r.status_code == 401:
+            raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     try:
         data = r.json()
     except Exception:
@@ -601,7 +633,8 @@ async def handle_token(client: Client, message: Message):
             return
 
         session = {"access_token": token, "token": token, "username": "token-login",
-                   "refresh_token": "", "host": "api.allen-live.in"}
+                   "refresh_token": "", "device_id": get_allen_device_id(),
+                   "host": "api.allen-live.in"}
         save_allen_session(session)
         await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
     except Exception as e:
@@ -616,13 +649,9 @@ async def handle_mybatches(client: Client, message: Message):
         await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
         return
 
-    token = get_allen_token()
-    if not token:
-        await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPlease run <code>/login username*password</code> first.</i></blockquote>")
-        return
-
     status_msg = await message.reply_text("<blockquote><i>🔄 <b>Fetching your purchased batches...</b></i></blockquote>")
     try:
+        token = await asyncio.to_thread(get_or_login_allen_token)
         info = await asyncio.to_thread(fetch_student_info, token)
         student = info.get("student_detail") or {}
         courses = info.get("course_details") or []
@@ -765,9 +794,10 @@ async def handle_batch(client: Client, message: Message):
         await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
         return
 
-    token = get_allen_token()
-    if not token:
-        await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPehle <code>/login username*password</code> karo.</i></blockquote>")
+    try:
+        token = await asyncio.to_thread(get_or_login_allen_token)
+    except Exception as e:
+        await message.reply_text(f"<blockquote><i>❌ <b>Session Error:</b> <code>{str(e)}</code></i></blockquote>")
         return
 
     # /batch <BATCH_ID> [subject] [-c <channel_id>]     (BATCH_ID optional = all batches)
