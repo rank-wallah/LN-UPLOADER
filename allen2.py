@@ -347,12 +347,19 @@ def _walk_page(node, contents, chapters):
                     contents.append({"id": d.get("content_id") or uri, "title": name, "url": uri})
         action = node.get("action")
         if isinstance(action, dict):
-            q = (action.get("data") or {}).get("query") or {}
+            action_data = action.get("data") or {}
+            q = action_data.get("query") or {}
             cur = (action.get("tracking_params") or {}).get("current") or {}
             if q.get("topic_id"):
-                chapters.append({"topic_id": q["topic_id"],
+                # Allen embeds the authoritative topic request in every chapter
+                # card.  Its batch_id can differ from the request that opened the
+                # subject page, so preserve and replay it instead of guessing.
+                query = {str(k): str(v) for k, v in q.items() if v is not None}
+                topic_uri = action_data.get("uri") or "/topic-details"
+                chapters.append({"topic_id": str(q["topic_id"]),
                                  "topic_name": cur.get("topic_name") or "Topic",
-                                 "subject_id": cur.get("subject_id")})
+                                 "subject_id": cur.get("subject_id") or q.get("subject_id"),
+                                 "page_url": str(topic_uri) + "?" + urlencode(query)})
         for value in node.values():
             _walk_page(value, contents, chapters)
     elif isinstance(node, list):
@@ -489,11 +496,19 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                 continue
             _add(f"[{cname} | {sname}]", contents)
             batch_ids, selected_list, taxonomy_id, stream = working_context
+            seen_chapters = set()
             for ch in chapters:
+                chapter_key = ch.get("page_url") or ch.get("topic_id")
+                if not chapter_key or chapter_key in seen_chapters:
+                    continue
+                seen_chapters.add(chapter_key)
+                # Prefer the exact URL returned by Allen in the subject page.
+                # Reconstruct only for older response shapes that omit it.
+                topic_page_url = ch.get("page_url") or ("/topic-details?" + _course_params(
+                    batch_ids, selected_list, cid, stream,
+                    ch.get("subject_id") or sid, ch["topic_id"], taxonomy_id))
                 try:
-                    tpage = allen_get_page("/topic-details?" + _course_params(
-                        batch_ids, selected_list, cid, stream,
-                        ch.get("subject_id") or sid, ch["topic_id"], taxonomy_id), token)
+                    tpage = allen_get_page(topic_page_url, token)
                 except Exception as e:
                     logger.warning(f"topic {ch.get('topic_name')} skipped: {e}")
                     continue
