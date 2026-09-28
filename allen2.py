@@ -129,49 +129,42 @@ def allen_login_idpass(username, password):
     if not username or not password:
         raise ValueError("Username and password cannot be empty")
 
-    endpoint = "https://live.allenbpms.in/api/auth/signin"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": "https://live.allenbpms.in",
-        "Referer": "https://live.allenbpms.in/login/",
-    }
     payload = {"username": username, "password": password}
-
-    try:
-        res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
-    except Exception as e:
-        raise ValueError(f"Network error contacting Allen BPMS: {e}")
-
-    try:
-        data = res.json()
-    except Exception:
-        data = {}
-
-    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-    token = (
-        data.get("token")
-        or data.get("access_token")
-        or inner.get("token")
-        or inner.get("access_token")
-        or inner.get("accessToken")
-    )
-
-    if res.status_code == 200 and token:
-        session = {
-            "access_token": token,
-            "token": token,
-            "username": username,
-            "login_at": int(time.time()),
+    hosts = ["student.allenbpms.in", "live.allenbpms.in"]
+    errors = []
+    for host in hosts:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": f"https://{host}",
+            "Referer": f"https://{host}/login/",
         }
-        if isinstance(data.get("data"), dict):
-            session["user"] = data["data"]
-        save_allen_session(session)
-        return token
+        try:
+            res = requests.post(f"https://{host}/api/auth/signin", json=payload, headers=headers, timeout=20)
+        except Exception as e:
+            errors.append(f"{host}: network error {e}")
+            continue
+        try:
+            data = res.json()
+        except Exception:
+            data = {}
+        inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+        token = (data.get("token") or data.get("access_token") or inner.get("token")
+                 or inner.get("access_token") or inner.get("accessToken"))
+        if res.status_code == 200 and token:
+            global ALLEN_BASE_URL
+            ALLEN_BASE_URL = f"https://{host}/api"
+            session = {"access_token": token, "token": token, "username": username,
+                       "host": host, "login_at": int(time.time())}
+            if inner:
+                session["user"] = inner
+            save_allen_session(session)
+            return token
+        reason = data.get("message") or data.get("reason") or res.text[:200]
+        errors.append(f"{host} (HTTP {res.status_code}): {reason}")
+    raise ValueError("Login failed -> " + " | ".join(errors))
 
-    reason = data.get("message") or data.get("reason") or res.text[:200]
-    raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
 
 
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
