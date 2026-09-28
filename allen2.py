@@ -105,7 +105,8 @@ app = Client(
     api_id=TG_API_ID,
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
-    workers=16,
+    workers=32,
+    max_concurrent_transmissions=4,
     parse_mode=enums.ParseMode.HTML
 )
 
@@ -202,6 +203,27 @@ from urllib.parse import urlencode
 ALLEN_PAGE_URL = "https://api.allen-live.in/api/v1/pages/getPage"
 ALLEN_TAXONOMY = os.getenv("ALLEN_TAXONOMY", "1739171216OJ")
 ALLEN_SUBJECTS = [("Physics", "1160"), ("Chemistry", "746"), ("Mathematics", "1264")]
+SUBJECT_ALIASES = {
+    "p": "Physics", "phy": "Physics", "physics": "Physics",
+    "c": "Chemistry", "chem": "Chemistry", "chemistry": "Chemistry",
+    "m": "Mathematics", "math": "Mathematics", "maths": "Mathematics",
+    "mathematics": "Mathematics",
+}
+# speed tuning (env-overridable)
+DL_THREADS = os.getenv("DL_THREADS", "48")
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "3"))
+
+
+def normalize_subject(raw):
+    """'phy' -> 'Physics'; 'all'/None -> None (= all subjects)."""
+    if not raw:
+        return None
+    key = str(raw).strip().lower()
+    if key in ("all", "*", "sab"):
+        return None
+    if key not in SUBJECT_ALIASES:
+        raise ValueError("Subject galat hai. Use: physics / chemistry / maths / all")
+    return SUBJECT_ALIASES[key]
 DONE_FILE = "uploaded_contents.json"
 
 
@@ -279,7 +301,7 @@ def _course_params(batches, course_id, stream, subject_id, topic_id=None):
     return urlencode(params)
 
 
-def fetch_batch_contents(batch_id=None, token=None):
+def fetch_batch_contents(batch_id=None, token=None, subject=None):
     """All downloadable items of one batch, or of ALL purchased batches when batch_id is None/'all'."""
     if not token:
         raise ValueError("No token. /login ya /token pehle karo.")
@@ -310,6 +332,8 @@ def fetch_batch_contents(batch_id=None, token=None):
         cname = course.get("course_name") or "Course"
         cid = course.get("course_id") or ""
         for sname, sid in ALLEN_SUBJECTS:
+            if subject and sname != subject:
+                continue
             try:
                 page = allen_get_page("/subject-details?" + _course_params(batches, cid, stream, sid), token)
             except Exception as e:
@@ -341,15 +365,17 @@ def download_file(url, output_path):
     return output_path
 
 
-def download_m3u8(m3u8_url, output_name, bearer_token=None):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
+    work_dir = work_dir or DOWNLOAD_DIR
+    os.makedirs(work_dir, exist_ok=True)
     cmd = [
         "N_m3u8DL-RE",
         m3u8_url,
         "--save-name", output_name,
-        "--save-dir", DOWNLOAD_DIR,
+        "--save-dir", work_dir,
+        "--tmp-dir", work_dir,
         "--auto-select",
-        "--thread-count", "16",
+        "--thread-count", DL_THREADS,
         "--download-retry-count", "10",
         "--no-log"
     ]
@@ -357,33 +383,33 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None):
         cmd.extend(["--header", f"Authorization: Bearer {bearer_token}"])
 
     subprocess.run(cmd, check=True)
-    output_path = os.path.join(DOWNLOAD_DIR, f"{output_name}.mp4")
+    output_path = os.path.join(work_dir, f"{output_name}.mp4")
 
     if not os.path.exists(output_path):
-        for file in os.listdir(DOWNLOAD_DIR):
+        for file in os.listdir(work_dir):
             if file.startswith(output_name):
-                return os.path.join(DOWNLOAD_DIR, file)
+                return os.path.join(work_dir, file)
     return output_path
 
-async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
-    return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token)
-
-def upload_to_telegram(app_client, target_chat_id, file_path, caption):
-    if file_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
-        return app_client.send_video(
-            chat_id=target_chat_id,
-            video=file_path,
-            caption=caption,
-            supports_streaming=True
-        )
-    return app_client.send_document(
-        chat_id=target_chat_id,
-        document=file_path,
-        caption=caption
-    )
+async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
+    return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
 
 async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
-    return await asyncio.to_thread(upload_to_telegram, app_client, target_chat_id, file_path, caption)
+    """Native async upload (tgcrypto) with FloodWait auto-retry."""
+    from pyrogram.errors import FloodWait
+    is_video = file_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov"))
+    for attempt in range(5):
+        try:
+            if is_video:
+                return await app_client.send_video(chat_id=target_chat_id, video=file_path,
+                                                   caption=caption, supports_streaming=True)
+            return await app_client.send_document(chat_id=target_chat_id, document=file_path,
+                                                  caption=caption)
+        except FloodWait as fw:
+            wait = int(getattr(fw, "value", 10) or 10)
+            logger.warning(f"FloodWait {wait}s (attempt {attempt + 1})")
+            await asyncio.sleep(wait + 1)
+    raise RuntimeError("Telegram FloodWait: upload baar baar ruk raha hai")
 
 # ==========================================
 # TELEGRAM BOT COMMAND HANDLERS
@@ -521,7 +547,7 @@ async def handle_mybatches(client: Client, message: Message):
             for b in c.get("unenrolled_batches") or []:
                 lines.append(f"   ➖ (unenrolled) <code>{b}</code>")
             lines.append("")
-        lines.append("Sab batches ek saath: <code>/downloadall</code>\nEk batch: <code>/batch &lt;BATCH_ID&gt;</code>")
+        lines.append("Poora batch: <code>/batch &lt;BATCH_ID&gt;</code>\nSubject-wise: <code>/batch &lt;BATCH_ID&gt; physics</code>\nSab ek saath: <code>/downloadall</code>\nHelp: <code>/subjects</code>")
         text = "\n".join(lines)
         if len(text) > MAX_TG_MSG_LEN:
             text = text[:MAX_TG_MSG_LEN] + "\n... (truncated)"
@@ -529,6 +555,114 @@ async def handle_mybatches(client: Client, message: Message):
     except Exception as e:
         logger.error(f"/mybatches failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Error:</b> <code>{str(e)}</code></i></blockquote>")
+
+def _job_key(chat_id, batch_id, subject):
+    return f"{chat_id}|{batch_id or 'ALL'}|{subject or 'ALL'}"
+
+
+async def run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg):
+    """Pipeline: parallel downloads feeding a single uploader -> max speed per job.
+    Multiple jobs (different batches / channels) can run at the same time."""
+    key = _job_key(target_chat_id, batch_id, subject)
+    ACTIVE_JOBS[key] = {"running": True, "chat": message.chat.id}
+    work_dir = os.path.join(DOWNLOAD_DIR, str(abs(hash(key)) % 10**8))
+    os.makedirs(work_dir, exist_ok=True)
+    done = load_done()
+    ok = failed = 0
+
+    try:
+        items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject)
+        pending = [i for i in items if i["id"] not in done]
+        if not items:
+            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila. <code>/mybatches</code> chalao.</i></blockquote>")
+            return
+        if not pending:
+            await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
+            return
+
+        total = len(pending)
+        await status_msg.edit_text(
+            f"<blockquote><i>🚀 <b>{total} new items</b> (total {len(items)}) — turbo mode ON "
+            f"({MAX_PARALLEL_DOWNLOADS} parallel downloads, {DL_THREADS} threads each)</i></blockquote>")
+
+        queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + 1)
+        index_iter = iter(list(enumerate(pending, start=1)))
+        lock = asyncio.Lock()
+
+        def running():
+            return ACTIVE_JOBS.get(key, {}).get("running", False)
+
+        async def downloader():
+            nonlocal failed
+            while running():
+                async with lock:
+                    nxt = next(index_iter, None)
+                if nxt is None:
+                    return
+                idx, item = nxt
+                title = item.get("title") or f"Lecture_{idx}"
+                clean = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()[:70] or f"item_{idx}"
+                clean = f"{idx}_{clean}"
+                url = item.get("url")
+                if not url:
+                    continue
+                try:
+                    if ".m3u8" in url:
+                        path = await async_download_m3u8(url, clean, token, work_dir)
+                    else:
+                        ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
+                        path = await asyncio.to_thread(download_file, url, os.path.join(work_dir, clean + ext))
+                    await queue.put((idx, item, title, path))
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Download failed ({title}): {e}")
+                    await message.reply_text(
+                        f"<blockquote><i>⚠️ Skipped: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+
+        async def uploader():
+            nonlocal ok, failed
+            finished = 0
+            while finished < total and running():
+                try:
+                    idx, item, title, path = await asyncio.wait_for(queue.get(), timeout=5)
+                except asyncio.TimeoutError:
+                    if all(d.done() for d in downloaders) and queue.empty():
+                        return
+                    continue
+                try:
+                    caption = f"<blockquote><i><b>{title}</b>\n\nAllen Auto-Downloader ({idx}/{total})</i></blockquote>"
+                    await async_upload_to_telegram(app, target_chat_id, path, caption)
+                    mark_done(item["id"], done)
+                    ok += 1
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Upload failed ({title}): {e}")
+                    await message.reply_text(
+                        f"<blockquote><i>⚠️ Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                finally:
+                    finished += 1
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                    gc.collect()
+
+        downloaders = [asyncio.create_task(downloader()) for _ in range(MAX_PARALLEL_DOWNLOADS)]
+        up = asyncio.create_task(uploader())
+        await asyncio.gather(*downloaders, return_exceptions=True)
+        await up
+
+        await message.reply_text(
+            f"<blockquote><i>✅ <b>Done!</b> Uploaded: {ok} | Failed: {failed}\n"
+            f"Scope: {batch_id or 'ALL batches'} | {subject or 'All subjects'}</i></blockquote>")
+    except Exception as e:
+        logger.error(f"Batch job failed: {e}")
+        await message.reply_text(f"<blockquote><i>❌ <b>Batch Error:</b> <code>{str(e)}</code></i></blockquote>")
+    finally:
+        ACTIVE_JOBS.pop(key, None)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
 
 @app.on_message(filters.command(["batch", "downloadall"]) & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
@@ -539,86 +673,90 @@ async def handle_batch(client: Client, message: Message):
 
     token = get_allen_token()
     if not token:
-        await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPlease run <code>/login username*password</code> first.</i></blockquote>")
+        await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPehle <code>/login username*password</code> karo.</i></blockquote>")
         return
 
-    args = (message.text or "").split(maxsplit=1)
-    batch_id = args[1].strip() if len(args) > 1 else None  # no ID = saare purchased batches
+    # /batch <BATCH_ID> [subject] [-c <channel_id>]     (BATCH_ID optional = all batches)
+    parts = (message.text or "").split()[1:]
     target_chat_id = message.chat.id
+    if "-c" in parts:
+        i = parts.index("-c")
+        try:
+            target_chat_id = int(parts[i + 1])
+        except Exception:
+            await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+            return
+        parts = parts[:i] + parts[i + 2:]
 
-    scope = "ALL purchased batches" if not batch_id else f"Batch <code>{batch_id}</code>"
-    status_msg = await message.reply_text(f"<blockquote><i>🔄 <b>Fetching content tree for {scope}...</b></i></blockquote>")
+    batch_id, subject_raw = None, None
+    for token_arg in parts:
+        low = token_arg.lower()
+        if low in SUBJECT_ALIASES or low in ("all", "*", "sab"):
+            if subject_raw is None and not (low in ("all", "*") and batch_id is None):
+                subject_raw = low
+            elif batch_id is None:
+                batch_id = None
+        elif batch_id is None:
+            batch_id = token_arg
 
-    done = load_done()
     try:
-        data_items = await asyncio.to_thread(fetch_batch_contents, batch_id, token)
-        pending = [i for i in data_items if i["id"] not in done]
-        if not data_items:
-            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila. Batch ID check karo ya /mybatches chalao.</i></blockquote>")
-            return
-        if not pending:
-            await status_msg.edit_text("<blockquote><i>✅ Sab content pehle hi upload ho chuka hai.</i></blockquote>")
-            return
+        subject = normalize_subject(subject_raw)
+    except ValueError as e:
+        await message.reply_text(f"<blockquote><i>⚠️ {e}</i></blockquote>")
+        return
 
-        ACTIVE_JOBS[target_chat_id] = {"running": True}
-        await status_msg.edit_text(
-            f"<blockquote><i>🚀 <b>{len(pending)} new items</b> (total {len(data_items)}). Download + upload shuru!</i></blockquote>")
+    key = _job_key(target_chat_id, batch_id, subject)
+    if ACTIVE_JOBS.get(key, {}).get("running"):
+        await message.reply_text("<blockquote><i>⚠️ Ye job already chal raha hai.</i></blockquote>")
+        return
 
-        ok, failed = 0, 0
-        for idx, item in enumerate(pending, start=1):
-            if not ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
-                await message.reply_text("<blockquote><i>🛑 Download Job Cancelled.</i></blockquote>")
-                break
+    scope = f"{batch_id or 'ALL batches'} | {subject or 'All subjects'}"
+    dest = "yahin" if target_chat_id == message.chat.id else f"<code>{target_chat_id}</code>"
+    status_msg = await message.reply_text(
+        f"<blockquote><i>🔄 <b>Fetching:</b> {scope}\nUpload → {dest}</i></blockquote>")
 
-            title = item.get("title") or f"Lecture_{idx}"
-            clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()[:70] or f"item_{idx}"
-            url = item.get("url")
-            if not url:
-                continue
+    # fire-and-forget so multiple batches/channels download simultaneously
+    asyncio.create_task(run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg))
 
-            file_path = None
-            try:
-                if ".m3u8" in url:
-                    file_path = await async_download_m3u8(url, clean_title, token)
-                else:
-                    ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
-                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                    file_path = await asyncio.to_thread(
-                        download_file, url, os.path.join(DOWNLOAD_DIR, clean_title + ext))
 
-                caption = f"<blockquote><i><b>{title}</b>\n\nAllen Auto-Downloader ({idx}/{len(pending)})</i></blockquote>"
-                await async_upload_to_telegram(app, target_chat_id, file_path, caption)
-                mark_done(item["id"], done)
-                ok += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Item failed ({title}): {e}")
-                await message.reply_text(f"<blockquote><i>⚠️ Skipped: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
-            finally:
-                if file_path and os.path.exists(file_path):
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-                gc.collect()
+@app.on_message(filters.command("subjects") & (filters.group | filters.channel | filters.private))
+async def handle_subjects(client: Client, message: Message):
+    await message.reply_text(
+        "<blockquote><i>📚 <b>Subject-wise download</b>\n\n"
+        "<code>/batch &lt;BATCH_ID&gt; physics</code>\n"
+        "<code>/batch &lt;BATCH_ID&gt; chemistry</code>\n"
+        "<code>/batch &lt;BATCH_ID&gt; maths</code>\n"
+        "<code>/batch &lt;BATCH_ID&gt; all</code>  (poora batch)\n"
+        "<code>/downloadall</code>  (saare batches, saare subjects)\n"
+        "<code>/downloadall physics</code>\n\n"
+        "Kisi channel me bhejna ho:\n"
+        "<code>/batch &lt;BATCH_ID&gt; physics -c -100xxxxxxxxxx</code>\n"
+        "(Bot ko us channel me admin banao. Alag-alag batches alag channels me ek saath chal sakte hain.)\n\n"
+        "<code>/jobs</code> — chal rahe kaam dekho | <code>/stop</code> — sab rok do</i></blockquote>")
 
-        await message.reply_text(
-            f"<blockquote><i>✅ <b>Finished!</b> Uploaded: {ok} | Failed: {failed}</i></blockquote>")
 
-    except Exception as e:
-        logger.error(f"Batch execution failed: {e}")
-        await message.reply_text(f"<blockquote><i>❌ <b>Batch Error:</b> <code>{str(e)}</code></i></blockquote>")
-    finally:
-        ACTIVE_JOBS[target_chat_id] = {"running": False}
+@app.on_message(filters.command("jobs"))
+async def handle_jobs(client: Client, message: Message):
+    mine = [k for k, v in ACTIVE_JOBS.items() if v.get("running")]
+    if not mine:
+        await message.reply_text("<blockquote><i>💤 Koi job nahi chal raha.</i></blockquote>")
+        return
+    await message.reply_text("<blockquote><i>⚙️ <b>Running jobs:</b>\n" +
+                             "\n".join(f"• <code>{k}</code>" for k in mine) + "</i></blockquote>")
+
 
 @app.on_message(filters.command("stop"))
 async def handle_stop(client: Client, message: Message):
-    chat_id = message.chat.id
-    if ACTIVE_JOBS.get(chat_id, {}).get("running"):
-        ACTIVE_JOBS[chat_id]["running"] = False
-        await message.reply_text("<blockquote><i>🛑 Stopping active download task...</i></blockquote>")
+    stopped = 0
+    for k, v in list(ACTIVE_JOBS.items()):
+        if v.get("running") and (v.get("chat") == message.chat.id or message.from_user and message.from_user.id == OWNER_ID):
+            v["running"] = False
+            stopped += 1
+    if stopped:
+        await message.reply_text(f"<blockquote><i>🛑 {stopped} job(s) rok diye.</i></blockquote>")
     else:
-        await message.reply_text("<blockquote><i>⚠️ No active task running in this chat.</i></blockquote>")
+        await message.reply_text("<blockquote><i>⚠️ Koi active task nahi hai.</i></blockquote>")
+
 
 @app.on_message(filters.command("id"))
 async def show_id(client: Client, message: Message):
