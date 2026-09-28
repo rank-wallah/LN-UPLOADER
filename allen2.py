@@ -116,6 +116,18 @@ def allen_headers(token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
     }
 
+def allen_content_headers(token):
+    """Match Allen web's content-request fingerprint exactly.
+
+    X-Device-Id belongs to login/session requests. Sending it to pages/getPage
+    can make that endpoint return HTTP 200 with an empty widgets list.
+    """
+    headers = allen_headers(token).copy()
+    headers.pop("X-Device-Id", None)
+    headers.pop("Accept", None)
+    headers.pop("Accept-Language", None)
+    return headers
+
 def fetch_student_info(token):
     """Fetch student profile + enrolled courses/batches from Allen Digital."""
     r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
@@ -296,12 +308,12 @@ def mark_done(content_id, done_set):
 
 def allen_get_page(page_url, token):
     r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
-                      headers=allen_headers(token), timeout=30)
+                      headers=allen_content_headers(token), timeout=30)
     if r.status_code == 401:
         if ALLEN_USERNAME and ALLEN_PASSWORD:
             token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
             r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
-                              headers=allen_headers(token), timeout=30)
+                              headers=allen_content_headers(token), timeout=30)
         if r.status_code == 401:
             raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     try:
@@ -902,7 +914,7 @@ async def handle_debug(client: Client, message: Message):
             for sname, sid in ALLEN_SUBJECTS:
                 page_url = "/subject-details?" + _course_params(
                     batch_ids, selected_batches, c.get("course_id") or "", stream, sid)
-                rr = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url}, headers=allen_headers(token), timeout=30)
+                rr = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url}, headers=allen_content_headers(token), timeout=30)
                 try:
                     body = rr.json()
                 except Exception:
