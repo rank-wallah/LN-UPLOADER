@@ -125,7 +125,11 @@ def allen_login_idpass(username, password):
     plausible token location.
     """
     endpoint = "https://api.allen-live.in/api/v1/auth/username"
-    device_id = str(uuid.uuid4())
+    # Allen validates this value from the JSON body. Keep one ID for the
+    # installation so the same account does not look like a new device on
+    # every login, and send all field spellings used by its web/mobile APIs.
+    previous_session = get_allen_session()
+    device_id = previous_session.get("device_id") or str(uuid.uuid4())
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -135,12 +139,15 @@ def allen_login_idpass(username, password):
         "Referer": "https://api.allen.in/",
         "DeviceID": device_id,
         "deviceId": device_id,
+        "device_id": device_id,
     }
     payload = {
         "username": username,
         "password": password,
         "grant_type": "password",
         "DeviceID": device_id,
+        "deviceId": device_id,
+        "device_id": device_id,
     }
 
     try:
