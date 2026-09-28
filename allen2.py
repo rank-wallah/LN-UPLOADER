@@ -432,18 +432,17 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
         selected_batches = list(dict.fromkeys(enrolled_batches + unenrolled_batches))
         if not selected_batches:
             continue
-        # Allen's web client uses different values for these two fields:
-        # batch_id = enrolled batches only; selected_batch_list = all course batches.
-        # Mixing unenrolled IDs into batch_id returns HTTP 200 with an empty page.
-        batch_variants = []
+        # Match Allen's working web downloader first: both fields receive the
+        # complete course batch list and the stream comes from student_detail.
+        # Narrower variants are fallbacks for accounts whose page configuration
+        # is scoped to an enrolled or explicitly selected batch.
+        batch_variants = [(selected_batches, selected_batches)]
         if enrolled_batches:
             batch_variants.append((enrolled_batches, selected_batches))
         if not wants_all:
             chosen = [str(batch_id)]
-            if str(batch_id) in enrolled_batches:
-                batch_variants.append((chosen, selected_batches))
+            batch_variants.append((chosen, selected_batches))
             batch_variants.append((chosen, chosen))
-        batch_variants.append((selected_batches, selected_batches))
         # Keep order while removing duplicate request variants.
         batch_variants = list(dict.fromkeys(
             (tuple(batch_ids), tuple(selected_list))
@@ -454,7 +453,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
         # Current studentInfo responses can expose the API enum on the student
         # and a display value on the course. Try both rather than assuming one.
         stream_variants = list(dict.fromkeys(str(v) for v in (
-            student_stream, course.get("stream"), course.get("stream_name")
+            student_stream, course.get("stream_enum_name"),
+            course.get("stream"), course.get("stream_name")
         ) if v))
         if not stream_variants:
             stream_variants = [""]
