@@ -427,16 +427,28 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"]})
 
     for course in courses:
-        selected_batches = list(course.get("enrolled_batches") or []) + list(course.get("unenrolled_batches") or [])
+        enrolled_batches = list(dict.fromkeys(str(v) for v in (course.get("enrolled_batches") or []) if v))
+        unenrolled_batches = list(dict.fromkeys(str(v) for v in (course.get("unenrolled_batches") or []) if v))
+        selected_batches = list(dict.fromkeys(enrolled_batches + unenrolled_batches))
         if not selected_batches:
             continue
-        # Allen's web client normally sends the complete course batch list in BOTH
-        # fields.  Some accounts accept only the chosen batch, so that is a fallback.
-        batch_variants = [(selected_batches, selected_batches)]
+        # Allen's web client uses different values for these two fields:
+        # batch_id = enrolled batches only; selected_batch_list = all course batches.
+        # Mixing unenrolled IDs into batch_id returns HTTP 200 with an empty page.
+        batch_variants = []
+        if enrolled_batches:
+            batch_variants.append((enrolled_batches, selected_batches))
         if not wants_all:
             chosen = [str(batch_id)]
-            batch_variants.append((chosen, selected_batches))
+            if str(batch_id) in enrolled_batches:
+                batch_variants.append((chosen, selected_batches))
             batch_variants.append((chosen, chosen))
+        batch_variants.append((selected_batches, selected_batches))
+        # Keep order while removing duplicate request variants.
+        batch_variants = list(dict.fromkeys(
+            (tuple(batch_ids), tuple(selected_list))
+            for batch_ids, selected_list in batch_variants
+        ))
         cname = course.get("course_name") or "Course"
         cid = course.get("course_id") or ""
         # Current studentInfo responses can expose the API enum on the student
@@ -454,7 +466,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             last_error = None
             for taxonomy_id in _taxonomy_candidates(info, course):
                 for stream in stream_variants:
-                    for batch_ids, selected_list in batch_variants:
+                    for batch_ids_tuple, selected_list_tuple in batch_variants:
+                        batch_ids, selected_list = list(batch_ids_tuple), list(selected_list_tuple)
                         try:
                             page = allen_get_page("/subject-details?" + _course_params(
                                 batch_ids, selected_list, cid, stream, sid,
@@ -719,8 +732,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         if not items:
             await status_msg.edit_text(
                 "<blockquote><i>❌ Allen ne is course/batch ke liye empty page bheja. "
-                "Pehle <code>/login</code> dobara karein, phir <code>/mybatches</code> se ✅ enrolled "
-                "Batch ID copy karke <code>/batch &lt;ID&gt; physics</code> chalayein.</i></blockquote>")
+                "Login/session valid hai; course mapping ka diagnostic server log me save hua hai.</i></blockquote>")
             return
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
