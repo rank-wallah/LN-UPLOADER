@@ -85,9 +85,11 @@ def allen_headers(token):
         "Cache-Control": "no-cache",
         "Origin": "https://allen.in",
         "Referer": "https://allen.in/",
-        "Sec-Ch-Ua": '"Chromium";v="137", "Google Chrome";v="137", "Not/A)Brand";v="24"',
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": 'Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Ch-Ua-Platform": "Windows",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "cross-site",
@@ -336,7 +338,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
     if not token:
         raise ValueError("No token. /login ya /token pehle karo.")
     info = fetch_student_info(token)
-    stream = (info.get("student_detail") or {}).get("stream") or ""
+    student = info.get("student_detail") or {}
+    student_stream = student.get("stream") or ""
     courses = info.get("course_details") or []
 
     wants_all = (not batch_id) or str(batch_id).strip().lower() in ("all", "*")
@@ -368,6 +371,13 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             batch_variants.append((chosen, chosen))
         cname = course.get("course_name") or "Course"
         cid = course.get("course_id") or ""
+        # Current studentInfo responses can expose the API enum on the student
+        # and a display value on the course. Try both rather than assuming one.
+        stream_variants = list(dict.fromkeys(str(v) for v in (
+            student_stream, course.get("stream"), course.get("stream_name")
+        ) if v))
+        if not stream_variants:
+            stream_variants = [""]
         for sname, sid in ALLEN_SUBJECTS:
             if subject and sname != subject:
                 continue
@@ -375,26 +385,29 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             working_context = None
             last_error = None
             for taxonomy_id in _taxonomy_candidates(info, course):
-                for batch_ids, selected_list in batch_variants:
-                    try:
-                        page = allen_get_page("/subject-details?" + _course_params(
-                            batch_ids, selected_list, cid, stream, sid,
-                            taxonomy_id=taxonomy_id), token)
-                        trial_contents, trial_chapters = [], []
-                        _walk_page(page, trial_contents, trial_chapters)
-                        if trial_contents or trial_chapters:
-                            contents, chapters = trial_contents, trial_chapters
-                            working_context = (batch_ids, selected_list, taxonomy_id)
-                            break
-                    except Exception as e:
-                        last_error = e
+                for stream in stream_variants:
+                    for batch_ids, selected_list in batch_variants:
+                        try:
+                            page = allen_get_page("/subject-details?" + _course_params(
+                                batch_ids, selected_list, cid, stream, sid,
+                                taxonomy_id=taxonomy_id), token)
+                            trial_contents, trial_chapters = [], []
+                            _walk_page(page, trial_contents, trial_chapters)
+                            if trial_contents or trial_chapters:
+                                contents, chapters = trial_contents, trial_chapters
+                                working_context = (batch_ids, selected_list, taxonomy_id, stream)
+                                break
+                        except Exception as e:
+                            last_error = e
+                    if working_context:
+                        break
                 if working_context:
                     break
             if not working_context:
                 logger.warning(f"subject {sname} returned no chapters/content: {last_error or 'empty page'}")
                 continue
             _add(f"[{cname} | {sname}]", contents)
-            batch_ids, selected_list, taxonomy_id = working_context
+            batch_ids, selected_list, taxonomy_id, stream = working_context
             for ch in chapters:
                 try:
                     tpage = allen_get_page("/topic-details?" + _course_params(
