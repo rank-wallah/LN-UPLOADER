@@ -78,9 +78,20 @@ def get_allen_token():
     session = get_allen_session()
     return session.get("access_token") or session.get("token")
 
+def get_allen_device_id():
+    """Use one stable device identity for login and every authenticated request."""
+    session = get_allen_session()
+    device_id = session.get("device_id")
+    if not device_id:
+        device_id = str(uuid.uuid4())
+        session["device_id"] = device_id
+        save_allen_session(session)
+    return device_id
+
 def allen_headers(token):
     return {
         "Authorization": f"Bearer {token}",
+        "X-Device-Id": get_allen_device_id(),
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
         "Origin": "https://allen.in",
@@ -160,7 +171,7 @@ def allen_login_idpass(username, password):
     if not username or not password:
         raise ValueError("Username and password cannot be empty")
 
-    device_id = str(uuid.uuid4())
+    device_id = get_allen_device_id()
     url = "https://api.allen-live.in/api/v1/auth/username"
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
@@ -195,6 +206,7 @@ def allen_login_idpass(username, password):
         ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
         session = {"access_token": token, "token": token,
                    "refresh_token": refresh,
+                   "device_id": device_id,
                    "username": username, "host": "api.allen-live.in",
                    "login_at": int(time.time())}
         save_allen_session(session)
@@ -266,7 +278,15 @@ def allen_get_page(page_url, token):
         raise ValueError(f"Allen page error (HTTP {r.status_code}): {r.text[:150]}")
     if data.get("status") != 200:
         raise ValueError(f"Allen error: {data.get('reason') or r.text[:150]}")
-    return data.get("data") or {}
+    page_data = data.get("data") or {}
+    widgets = ((page_data.get("page_content") or {}).get("widgets")
+               if isinstance(page_data, dict) else None)
+    if not widgets:
+        logger.warning(
+            "Allen empty page: http=%s reason=%s path=%s data_keys=%s",
+            r.status_code, data.get("reason"), page_url.split("?", 1)[0],
+            list(page_data.keys()) if isinstance(page_data, dict) else [])
+    return page_data
 
 
 def _walk_page(node, contents, chapters):
