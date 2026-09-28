@@ -138,7 +138,8 @@ def allen_login_idpass(username, password):
         "Origin": "https://api.allen.in",
         "Referer": "https://api.allen.in/",
         "DeviceID": device_id,
-        "deviceId": device_id,
+        "device-id": device_id,
+        "X-Device-Id": device_id,
         "device_id": device_id,
     }
     payload = {
@@ -148,10 +149,17 @@ def allen_login_idpass(username, password):
         "DeviceID": device_id,
         "deviceId": device_id,
         "device_id": device_id,
+        "deviceid": device_id,
     }
 
     try:
-        res = requests.post(endpoint, json=payload, headers=headers, timeout=20)
+        res = requests.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            params={"device_id": device_id},
+            timeout=20,
+        )
     except Exception as e:
         raise ValueError(f"Network error contacting Allen: {e}")
 
