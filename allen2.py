@@ -194,6 +194,153 @@ def allen_login_idpass(username, password):
 
 
 
+# ==========================================
+# BATCH CONTENT DISCOVERY (pages/getPage API)
+# ==========================================
+from urllib.parse import urlencode
+
+ALLEN_PAGE_URL = "https://api.allen-live.in/api/v1/pages/getPage"
+ALLEN_TAXONOMY = os.getenv("ALLEN_TAXONOMY", "1739171216OJ")
+ALLEN_SUBJECTS = [("Physics", "1160"), ("Chemistry", "746"), ("Mathematics", "1264")]
+DONE_FILE = "uploaded_contents.json"
+
+
+def load_done():
+    if os.path.exists(DONE_FILE):
+        try:
+            with open(DONE_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def mark_done(content_id, done_set):
+    done_set.add(content_id)
+    try:
+        with open(DONE_FILE, "w") as f:
+            json.dump(list(done_set), f)
+    except Exception as e:
+        logger.warning(f"Could not persist progress: {e}")
+
+
+def allen_get_page(page_url, token):
+    r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
+                      headers=allen_headers(token), timeout=30)
+    if r.status_code == 401:
+        raise ValueError("Session expire ho gaya. /login ya /token se dobara login karo.")
+    try:
+        data = r.json()
+    except Exception:
+        raise ValueError(f"Allen page error (HTTP {r.status_code}): {r.text[:150]}")
+    if data.get("status") != 200:
+        raise ValueError(f"Allen error: {data.get('reason') or r.text[:150]}")
+    return data.get("data") or {}
+
+
+def _walk_page(node, contents, chapters):
+    """Recursively collect playable contents and chapter/topic links from a page tree."""
+    if isinstance(node, dict):
+        for key in ("content_action", "card_action"):
+            action = node.get(key)
+            if isinstance(action, dict):
+                d = action.get("data") or {}
+                uri, title = d.get("uri"), d.get("title")
+                if uri and title and str(uri).startswith("http"):
+                    subtitle = node.get("subtitle") or ""
+                    name = f"{str(subtitle)[:10]} {title}".strip() if subtitle else title
+                    contents.append({"id": d.get("content_id") or uri, "title": name, "url": uri})
+        action = node.get("action")
+        if isinstance(action, dict):
+            q = (action.get("data") or {}).get("query") or {}
+            cur = (action.get("tracking_params") or {}).get("current") or {}
+            if q.get("topic_id"):
+                chapters.append({"topic_id": q["topic_id"],
+                                 "topic_name": cur.get("topic_name") or "Topic",
+                                 "subject_id": cur.get("subject_id")})
+        for value in node.values():
+            _walk_page(value, contents, chapters)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_page(value, contents, chapters)
+
+
+def _course_params(batches, course_id, stream, subject_id, topic_id=None):
+    params = {
+        "batch_id": ",".join(batches),
+        "selected_batch_list": ",".join(batches),
+        "selected_course_id": course_id,
+        "stream": stream,
+        "subject_id": subject_id,
+        "taxonomy_id": ALLEN_TAXONOMY,
+    }
+    if topic_id:
+        params["topic_id"] = topic_id
+    return urlencode(params)
+
+
+def fetch_batch_contents(batch_id=None, token=None):
+    """All downloadable items of one batch, or of ALL purchased batches when batch_id is None/'all'."""
+    if not token:
+        raise ValueError("No token. /login ya /token pehle karo.")
+    info = fetch_student_info(token)
+    stream = (info.get("student_detail") or {}).get("stream") or ""
+    courses = info.get("course_details") or []
+
+    wants_all = (not batch_id) or str(batch_id).strip().lower() in ("all", "*")
+    if not wants_all:
+        matched = [c for c in courses if batch_id in
+                   (list(c.get("enrolled_batches") or []) + list(c.get("unenrolled_batches") or []))]
+        courses = matched or [{"course_id": "", "course_name": "Batch",
+                               "enrolled_batches": [batch_id], "unenrolled_batches": []}]
+
+    items, seen = [], set()
+
+    def _add(prefix, found):
+        for it in found:
+            if it["id"] in seen:
+                continue
+            seen.add(it["id"])
+            items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"]})
+
+    for course in courses:
+        batches = list(course.get("enrolled_batches") or []) + list(course.get("unenrolled_batches") or [])
+        if not batches:
+            continue
+        cname = course.get("course_name") or "Course"
+        cid = course.get("course_id") or ""
+        for sname, sid in ALLEN_SUBJECTS:
+            try:
+                page = allen_get_page("/subject-details?" + _course_params(batches, cid, stream, sid), token)
+            except Exception as e:
+                logger.warning(f"subject {sname} skipped: {e}")
+                continue
+            contents, chapters = [], []
+            _walk_page(page, contents, chapters)
+            _add(f"[{cname} | {sname}]", contents)
+            for ch in chapters:
+                try:
+                    tpage = allen_get_page("/topic-details?" + _course_params(
+                        batches, cid, stream, ch.get("subject_id") or sid, ch["topic_id"]), token)
+                except Exception as e:
+                    logger.warning(f"topic {ch.get('topic_name')} skipped: {e}")
+                    continue
+                tcontents, tch = [], []
+                _walk_page(tpage, tcontents, tch)
+                _add(f"[{sname} | {ch.get('topic_name')}]", tcontents)
+    return items
+
+
+def download_file(url, output_path):
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    return output_path
+
+
 def download_m3u8(m3u8_url, output_name, bearer_token=None):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     cmd = [
@@ -222,11 +369,17 @@ async def async_download_m3u8(m3u8_url, output_name, bearer_token=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token)
 
 def upload_to_telegram(app_client, target_chat_id, file_path, caption):
-    return app_client.send_video(
+    if file_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+        return app_client.send_video(
+            chat_id=target_chat_id,
+            video=file_path,
+            caption=caption,
+            supports_streaming=True
+        )
+    return app_client.send_document(
         chat_id=target_chat_id,
-        video=file_path,
-        caption=caption,
-        supports_streaming=True
+        document=file_path,
+        caption=caption
     )
 
 async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
@@ -368,7 +521,7 @@ async def handle_mybatches(client: Client, message: Message):
             for b in c.get("unenrolled_batches") or []:
                 lines.append(f"   ➖ (unenrolled) <code>{b}</code>")
             lines.append("")
-        lines.append("Download ke liye: <code>/batch &lt;BATCH_ID&gt;</code>")
+        lines.append("Sab batches ek saath: <code>/downloadall</code>\nEk batch: <code>/batch &lt;BATCH_ID&gt;</code>")
         text = "\n".join(lines)
         if len(text) > MAX_TG_MSG_LEN:
             text = text[:MAX_TG_MSG_LEN] + "\n... (truncated)"
@@ -377,7 +530,7 @@ async def handle_mybatches(client: Client, message: Message):
         logger.error(f"/mybatches failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Error:</b> <code>{str(e)}</code></i></blockquote>")
 
-@app.on_message(filters.command("batch") & (filters.group | filters.channel | filters.private))
+@app.on_message(filters.command(["batch", "downloadall"]) & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
     logger.info(f"/batch triggered by {message.from_user.id if message.from_user else 'Unknown'}")
     if message.from_user and not is_user_authorized(message.from_user.id):
@@ -389,44 +542,68 @@ async def handle_batch(client: Client, message: Message):
         await message.reply_text("<blockquote><i>⚠️ <b>No Active Session!</b>\n\nPlease run <code>/login username*password</code> first.</i></blockquote>")
         return
 
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/batch &lt;BATCH_ID&gt;</code></i></blockquote>")
-        return
-
-    batch_id = args[1].strip()
+    args = (message.text or "").split(maxsplit=1)
+    batch_id = args[1].strip() if len(args) > 1 else None  # no ID = saare purchased batches
     target_chat_id = message.chat.id
 
-    status_msg = await message.reply_text("<blockquote><i>🔄 <b>Fetching Full Batch Tree from Allen Server...</b></i></blockquote>")
+    scope = "ALL purchased batches" if not batch_id else f"Batch <code>{batch_id}</code>"
+    status_msg = await message.reply_text(f"<blockquote><i>🔄 <b>Fetching content tree for {scope}...</b></i></blockquote>")
 
+    done = load_done()
     try:
         data_items = await asyncio.to_thread(fetch_batch_contents, batch_id, token)
+        pending = [i for i in data_items if i["id"] not in done]
         if not data_items:
-            await status_msg.edit_text("<blockquote><i>❌ No items found in this Batch ID.</i></blockquote>")
+            await status_msg.edit_text("<blockquote><i>❌ Koi content nahi mila. Batch ID check karo ya /mybatches chalao.</i></blockquote>")
+            return
+        if not pending:
+            await status_msg.edit_text("<blockquote><i>✅ Sab content pehle hi upload ho chuka hai.</i></blockquote>")
             return
 
         ACTIVE_JOBS[target_chat_id] = {"running": True}
-        await status_msg.edit_text(f"<blockquote><i>🚀 <b>Processing {len(data_items)} Content Items... High-Speed Engine Active!</b></i></blockquote>")
+        await status_msg.edit_text(
+            f"<blockquote><i>🚀 <b>{len(pending)} new items</b> (total {len(data_items)}). Download + upload shuru!</i></blockquote>")
 
-        for idx, item in enumerate(data_items, start=1):
+        ok, failed = 0, 0
+        for idx, item in enumerate(pending, start=1):
             if not ACTIVE_JOBS.get(target_chat_id, {}).get("running", False):
                 await message.reply_text("<blockquote><i>🛑 Download Job Cancelled.</i></blockquote>")
                 break
 
-            title = item.get("title", f"Lecture_{idx}")
-            clean_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).rstrip()
+            title = item.get("title") or f"Lecture_{idx}"
+            clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()[:70] or f"item_{idx}"
+            url = item.get("url")
+            if not url:
+                continue
 
-            if item.get("url"):
-                video_path = await async_download_m3u8(item["url"], clean_title, token)
-                caption = f"<blockquote><i><b>{title}</b>\n\nAllen High-Speed Auto-Downloader</i></blockquote>"
+            file_path = None
+            try:
+                if ".m3u8" in url:
+                    file_path = await async_download_m3u8(url, clean_title, token)
+                else:
+                    ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
+                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+                    file_path = await asyncio.to_thread(
+                        download_file, url, os.path.join(DOWNLOAD_DIR, clean_title + ext))
 
-                await async_upload_to_telegram(app, target_chat_id, video_path, caption)
-
-                if os.path.exists(video_path):
-                    os.remove(video_path)
+                caption = f"<blockquote><i><b>{title}</b>\n\nAllen Auto-Downloader ({idx}/{len(pending)})</i></blockquote>"
+                await async_upload_to_telegram(app, target_chat_id, file_path, caption)
+                mark_done(item["id"], done)
+                ok += 1
+            except Exception as e:
+                failed += 1
+                logger.error(f"Item failed ({title}): {e}")
+                await message.reply_text(f"<blockquote><i>⚠️ Skipped: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+            finally:
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
                 gc.collect()
 
-        await message.reply_text("<blockquote><i>✅ <b>Batch Execution Finished Completely!</b></i></blockquote>")
+        await message.reply_text(
+            f"<blockquote><i>✅ <b>Finished!</b> Uploaded: {ok} | Failed: {failed}</i></blockquote>")
 
     except Exception as e:
         logger.error(f"Batch execution failed: {e}")
