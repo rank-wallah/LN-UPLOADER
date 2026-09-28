@@ -141,8 +141,8 @@ def allen_login_idpass(username, password):
     payload = {
         "username": username,
         "password": password,
-        "grant_type": "password",
-        "DeviceID": device_id,
+        "persona_type": "STUDENT",
+        "identity_type": "FORM_ID",
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=20)
@@ -154,12 +154,15 @@ def allen_login_idpass(username, password):
         data = {}
     inner = data.get("data") or {}
     token = (data.get("access_token") or data.get("token")
-             or inner.get("access_token") or inner.get("token") or inner.get("accessToken"))
+             or inner.get("access_token") or inner.get("token") or inner.get("accessToken")
+             or res.headers.get("X-ACCESS-TOKEN") or res.headers.get("x-access-token"))
+    refresh = (data.get("refresh_token") or inner.get("refresh_token") or inner.get("refreshToken")
+               or res.headers.get("X-REFRESH-TOKEN") or res.headers.get("x-refresh-token") or "")
     if res.status_code == 200 and token:
         global ALLEN_BASE_URL
         ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
         session = {"access_token": token, "token": token,
-                   "refresh_token": data.get("refresh_token") or inner.get("refresh_token") or inner.get("refreshToken") or "",
+                   "refresh_token": refresh,
                    "username": username, "host": "api.allen-live.in",
                    "login_at": int(time.time())}
         save_allen_session(session)
