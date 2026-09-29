@@ -879,7 +879,7 @@ def prepare_video_for_upload(source_path):
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     # Sanitize odd dimensions, sample aspect ratio and pixel format. Limiting x264
     # threads prevents parallel uploads from exhausting a small Heroku worker.
-    label = ("scale=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1,format=yuv420p,"
+    label = ("scale=-2:'min(480\\,trunc(ih/2)*2)',setsar=1,format=yuv420p,"
              "drawtext=fontfile=" + font + ":text=courierWell:"
              "fontcolor=white@0.80:fontsize=max(18\\,h/36):"
              "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
@@ -889,8 +889,8 @@ def prepare_video_for_upload(source_path):
                 "-filter_threads", "1", "-i", source_path,
                 "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
                 "-vf", video_filter, "-fps_mode", "vfr",
-                "-c:v", "libx264", "-preset", preset, "-crf", "24",
-                "-pix_fmt", "yuv420p", "-threads", "2",
+                "-c:v", "libx264", "-preset", preset, "-crf", "26", "-tune", "fastdecode",
+                "-pix_fmt", "yuv420p", "-threads", "3",
                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
                 "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
                 video_path]
@@ -901,7 +901,7 @@ def prepare_video_for_upload(source_path):
             if os.path.exists(video_path):
                 os.remove(video_path)
             # Broken/very large source metadata fallback: normalize to at most 720p.
-            fallback = ("scale='min(1280\\,ceil(iw/2)*2)':'min(720\\,ceil(ih/2)*2)':"
+            fallback = ("scale='min(854\\,ceil(iw/2)*2)':'min(480\\,ceil(ih/2)*2)':"
                         "force_original_aspect_ratio=decrease:force_divisible_by=2,"
                         "setsar=1,format=yuv420p,drawtext=fontfile=" + font +
                         ":text=courierWell:fontcolor=white@0.80:fontsize=max(18\\,h/36):"
