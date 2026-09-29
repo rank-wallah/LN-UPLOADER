@@ -3,6 +3,7 @@ FROM python:3.10-slim
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fonts-dejavu-core \
     wget \
     tar \
     ca-certificates \
