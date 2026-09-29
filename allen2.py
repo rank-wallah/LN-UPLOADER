@@ -167,7 +167,7 @@ app = Client(
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
     workers=64,
-    max_concurrent_transmissions=8,
+    max_concurrent_transmissions=16,
     parse_mode=enums.ParseMode.HTML
 )
 
@@ -274,7 +274,7 @@ SUBJECT_ALIASES = {
 }
 # speed tuning (env-overridable)
 DL_THREADS = os.getenv("DL_THREADS", "96")
-MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "6"))
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "8"))
 
 
 def normalize_subject(raw):
@@ -1113,10 +1113,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             f"<blockquote><i>🚀 <b>{total} new items</b> (total {len(items)}) — turbo mode ON "
             f"({MAX_PARALLEL_DOWNLOADS} parallel downloads, {DL_THREADS} threads each)</i></blockquote>")
 
-        queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + 1)
+        UPLOAD_PARALLELISM = int(os.getenv("UPLOAD_PARALLELISM", "6"))
+        queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + UPLOAD_PARALLELISM + 2)
         # Bound downloaded files too: a slow first lecture must not fill the disk
         # while later parallel downloads complete ahead of it.
-        slots = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS + 1)
+        slots = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS + UPLOAD_PARALLELISM + 2)
         index_iter = iter(list(enumerate(pending, start=1)))
         lock = asyncio.Lock()
 
@@ -1157,66 +1158,91 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 # Even failures have an index, so the uploader can advance in order.
                 await queue.put((idx, item, title, path))
 
+        chapter_events = {}
+        chapter_lock = asyncio.Lock()
+
         async def uploader():
             nonlocal ok, failed, last_chapter
             next_index = 1
             ready = {}
+            in_flight = set()
+
+            async def upload_one(idx, item, title, path):
+                nonlocal ok, failed, last_chapter
+                video_path = thumb_path = None
+                try:
+                    if path is None:
+                        return
+                    upload_path = path
+                    if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                        video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
+                        upload_path = video_path
+                    subj = str(item.get("subject") or "").strip()
+                    topic = str(item.get("topic") or "").strip()
+                    chap = f"{subj} - {topic}" if subj and topic and topic != subj else (topic or subj or "Chapter")
+                    async with chapter_lock:
+                        ev = chapter_events.get(chap)
+                        if ev is None:
+                            ev = asyncio.Event()
+                            chapter_events[chap] = ev
+                            first = True
+                        else:
+                            first = False
+                    if first:
+                        try:
+                            cm = await app.send_message(target_chat_id,
+                                                        f"<b>\U0001F4CC {html.escape(chap)}</b>")
+                            log_uploaded_message(target_chat_id, getattr(cm, "id", None))
+                            chapter_index.append((chap, getattr(cm, "link", None)))
+                            try:
+                                await cm.pin(disable_notification=True)
+                            except Exception as pe:
+                                logger.warning(f"Pin failed: {pe}")
+                        except Exception as ce:
+                            logger.warning(f"Chapter header failed: {ce}")
+                        ev.set()
+                    else:
+                        await ev.wait()
+                    dur = w = h = 0
+                    if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                        dur, w, h = await asyncio.to_thread(probe_video, upload_path)
+                    caption = build_caption(item, upload_path, dur)
+                    await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path, dur, w, h)
+                    mark_done(item["id"], done)
+                    ok += 1
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Upload failed ({title}): {e}")
+                    await message.reply_text(
+                        f"<blockquote><i>\u26A0\uFE0F Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                finally:
+                    for output in (path, video_path, thumb_path):
+                        if output and os.path.exists(output):
+                            try:
+                                os.remove(output)
+                            except Exception:
+                                pass
+                    slots.release()
+                    gc.collect()
+
             while next_index <= total and running():
                 try:
                     result = await asyncio.wait_for(queue.get(), timeout=5)
                     ready[result[0]] = result
                 except asyncio.TimeoutError:
                     if all(d.done() for d in downloaders) and queue.empty():
-                        return
+                        break
                     continue
-                while next_index in ready and running():
+                while next_index in ready:
+                    if len(in_flight) >= UPLOAD_PARALLELISM:
+                        done_tasks, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                        in_flight -= done_tasks
+                        continue
                     idx, item, title, path = ready.pop(next_index)
                     next_index += 1
-                    video_path = thumb_path = None
-                    try:
-                        if path is None:
-                            continue
-                        upload_path = path
-                        if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
-                            video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
-                            upload_path = video_path
-                        subj = str(item.get("subject") or "").strip()
-                        topic = str(item.get("topic") or "").strip()
-                        chap = f"{subj} - {topic}" if subj and topic and topic != subj else (topic or subj or "Chapter")
-                        if chap != last_chapter:
-                            last_chapter = chap
-                            try:
-                                cm = await app.send_message(target_chat_id,
-                                                            f"<b>📌 {html.escape(chap)}</b>")
-                                log_uploaded_message(target_chat_id, getattr(cm, "id", None))
-                                chapter_index.append((chap, getattr(cm, "link", None)))
-                                try:
-                                    await cm.pin(disable_notification=True)
-                                except Exception as pe:
-                                    logger.warning(f"Pin failed: {pe}")
-                            except Exception as ce:
-                                logger.warning(f"Chapter header failed: {ce}")
-                        dur = w = h = 0
-                        if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
-                            dur, w, h = await asyncio.to_thread(probe_video, upload_path)
-                        caption = build_caption(item, upload_path, dur)
-                        await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path, dur, w, h)
-                        mark_done(item["id"], done)
-                        ok += 1
-                    except Exception as e:
-                        failed += 1
-                        logger.error(f"Upload failed ({title}): {e}")
-                        await message.reply_text(
-                            f"<blockquote><i>⚠️ Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
-                    finally:
-                        for output in (path, video_path, thumb_path):
-                            if output and os.path.exists(output):
-                                try:
-                                    os.remove(output)
-                                except Exception:
-                                    pass
-                        slots.release()
-                        gc.collect()
+                    in_flight.add(asyncio.create_task(upload_one(idx, item, title, path)))
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
         downloaders = [asyncio.create_task(downloader()) for _ in range(MAX_PARALLEL_DOWNLOADS)]
         up = asyncio.create_task(uploader())
