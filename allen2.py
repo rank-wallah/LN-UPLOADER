@@ -872,30 +872,44 @@ async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
 
 def prepare_video_for_upload(source_path):
-    """Burn the channel watermark into the video and create its Telegram cover."""
+    """Burn the channel watermark into a Telegram-safe H.264 video."""
     stem, _ = os.path.splitext(source_path)
     video_path = stem + ".watermarked.mp4"
     thumb_path = stem + ".cover.jpg"
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    # A text watermark is independent of external logo URLs or expired media links.
-    label = ("drawtext=fontfile=" + font + ":text=courierWell:"
-             "fontcolor=white@0.80:fontsize=h/36:"
-             "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24,"
-             "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p")
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
-           "-map", "0:v:0", "-map", "0:a:0?", "-vf", label,
-           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-           "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", video_path]
+    # Sanitize odd dimensions, sample aspect ratio and pixel format. Limiting x264
+    # threads prevents parallel uploads from exhausting a small Heroku worker.
+    label = ("scale=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1,format=yuv420p,"
+             "drawtext=fontfile=" + font + ":text=courierWell:"
+             "fontcolor=white@0.80:fontsize=max(18\\,h/36):"
+             "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
+
+    def watermark_cmd(video_filter, preset="ultrafast"):
+        return ["ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+                "-filter_threads", "1", "-i", source_path,
+                "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+                "-vf", video_filter, "-fps_mode", "vfr",
+                "-c:v", "libx264", "-preset", preset, "-crf", "24",
+                "-pix_fmt", "yuv420p", "-threads", "2",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
+                video_path]
+
     try:
-        result = _run(cmd, 7200, os.path.dirname(source_path))
+        result = _run(watermark_cmd(label), 7200, os.path.dirname(source_path))
         if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
-            # Retry once with plain settings before giving up.
-            simple = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
-                      "-vf", label, "-c:v", "libx264", "-preset", "ultrafast",
-                      "-pix_fmt", "yuv420p", "-c:a", "aac", video_path]
-            result = _run(simple, 7200, os.path.dirname(source_path))
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            # Broken/very large source metadata fallback: normalize to at most 720p.
+            fallback = ("scale='min(1280\\,ceil(iw/2)*2)':'min(720\\,ceil(ih/2)*2)':"
+                        "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                        "setsar=1,format=yuv420p,drawtext=fontfile=" + font +
+                        ":text=courierWell:fontcolor=white@0.80:fontsize=max(18\\,h/36):"
+                        "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
+            result = _run(watermark_cmd(fallback), 7200, os.path.dirname(source_path))
         if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
-            raise RuntimeError(f"Video watermark failed: {result.stderr[-300:]}")
+            error = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            raise RuntimeError(f"Video watermark failed: {error[-600:]}")
         # Extract a frame from the watermarked video: cover and video match.
         for seek in ("2", "0"):
             result = subprocess.run(
