@@ -166,8 +166,8 @@ app = Client(
     api_id=TG_API_ID,
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
-    workers=32,
-    max_concurrent_transmissions=4,
+    workers=64,
+    max_concurrent_transmissions=8,
     parse_mode=enums.ParseMode.HTML
 )
 
@@ -273,8 +273,8 @@ SUBJECT_ALIASES = {
     "mathematics": "Mathematics",
 }
 # speed tuning (env-overridable)
-DL_THREADS = os.getenv("DL_THREADS", "48")
-MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "3"))
+DL_THREADS = os.getenv("DL_THREADS", "96")
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "6"))
 
 
 def normalize_subject(raw):
