@@ -627,31 +627,65 @@ def download_file(url, output_path):
     return output_path
 
 
+def _find_output(work_dir, output_name):
+    best = None
+    for file in os.listdir(work_dir):
+        if file.startswith(output_name) and file.lower().endswith((".mp4", ".mkv", ".ts", ".m4a")):
+            p = os.path.join(work_dir, file)
+            if os.path.isfile(p) and os.path.getsize(p) > 0 and (not best or os.path.getsize(p) > os.path.getsize(best)):
+                best = p
+    return best
+
+
 def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
+    """Allen CDN URLs are already signed (hdnts). Sending the API Bearer token
+    to the CDN makes it reject the request, so it is NOT sent. Falls back to
+    ffmpeg if N_m3u8DL-RE fails."""
     work_dir = work_dir or DOWNLOAD_DIR
     os.makedirs(work_dir, exist_ok=True)
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36"
     cmd = [
-        "N_m3u8DL-RE",
-        m3u8_url,
+        "N_m3u8DL-RE", m3u8_url,
         "--save-name", output_name,
         "--save-dir", work_dir,
         "--tmp-dir", work_dir,
-        "--auto-select",
-        "--thread-count", DL_THREADS,
+        "-sv", "best", "-sa", "best",
+        "-M", "format=mp4",
+        "--thread-count", str(DL_THREADS),
         "--download-retry-count", "10",
-        "--no-log"
+        "--del-after-done",
+        "--no-log",
+        "-H", f"User-Agent: {ua}",
+        "-H", "Origin: https://allen.in",
+        "-H", "Referer: https://allen.in/",
     ]
-    if bearer_token:
-        cmd.extend(["--header", f"Authorization: Bearer {bearer_token}"])
+    err = ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        out = _find_output(work_dir, output_name)
+        if r.returncode == 0 and out:
+            return out
+        err = (r.stderr or r.stdout or "")[-300:]
+        logger.warning(f"N_m3u8DL-RE failed ({r.returncode}): {err}")
+    except Exception as e:
+        err = str(e)
+        logger.warning(f"N_m3u8DL-RE error: {e}")
 
-    subprocess.run(cmd, check=True)
-    output_path = os.path.join(work_dir, f"{output_name}.mp4")
-
-    if not os.path.exists(output_path):
-        for file in os.listdir(work_dir):
-            if file.startswith(output_name):
-                return os.path.join(work_dir, file)
-    return output_path
+    # Fallback: ffmpeg direct copy
+    out_path = os.path.join(work_dir, f"{output_name}.mp4")
+    fcmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-user_agent", ua,
+        "-headers", "Origin: https://allen.in\r\nReferer: https://allen.in/\r\n",
+        "-i", m3u8_url,
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-c", "copy", "-bsf:a", "aac_adtstoasc",
+        out_path,
+    ]
+    r = subprocess.run(fcmd, capture_output=True, text=True, timeout=3600)
+    if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    raise RuntimeError(f"Download failed. RE: {err[-120:]} | ffmpeg: {(r.stderr or '')[-150:]}")
 
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
