@@ -124,8 +124,9 @@ def allen_content_headers(token):
     """
     headers = allen_headers(token).copy()
     headers.pop("X-Device-Id", None)
-    headers.pop("Accept", None)
-    headers.pop("Accept-Language", None)
+    # Allen's navigation renderer content-negotiates these headers. Removing
+    # Accept/Accept-Language makes /library-web return a misleading 404 even
+    # with a valid token, so preserve the browser fingerprint exactly.
     return headers
 
 def fetch_student_info(token):
