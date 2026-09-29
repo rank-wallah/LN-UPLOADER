@@ -393,8 +393,6 @@ def build_caption(item, file_path, duration=0):
         topic_line = subject or topic or "Topic"
 
     lines = [f"File Title : {file_title}"]
-    if duration:
-        lines.append(f"Duration : {_fmt_duration(duration)}")
     lines += [f"Batch Name : {batch}", f"Topic Name : {topic_line}", "Extracted By ➤ Courier Well"]
     caption = "\n".join(lines)
     return html.escape(caption)
