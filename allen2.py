@@ -738,7 +738,13 @@ def _run(cmd, timeout, work_dir):
     key = os.path.abspath(work_dir)
     if key in STOPPED_DIRS:
         raise RuntimeError("Stopped by user")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    env = dict(os.environ)
+    env.setdefault("TERM", "xterm-256color")
+    env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
+    env["DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION"] = "0"
+    env["NO_COLOR"] = "1"
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, env=env)
     RUNNING_PROCS.setdefault(key, set()).add(proc)
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -806,23 +812,26 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
         "-H", "Referer: https://allen.in/",
     ]
     err = ""
-    try:
-        r = _run(cmd, 3600, work_dir)
-        out = _find_output(work_dir, output_name)
-        if r.returncode == 0 and out:
-            return out
-        err = (r.stderr or r.stdout or "")[-300:]
-        logger.warning(f"N_m3u8DL-RE failed ({r.returncode}): {err}")
-    except Exception as e:
-        if "Stopped by user" in str(e):
-            raise
-        err = str(e)
-        logger.warning(f"N_m3u8DL-RE error: {e}")
+    for attempt in range(2):
+        try:
+            r = _run(cmd, 3600, work_dir)
+            out = _find_output(work_dir, output_name)
+            if r.returncode == 0 and out:
+                return out
+            err = (r.stderr or r.stdout or "")[-300:]
+            logger.warning(f"N_m3u8DL-RE failed ({r.returncode}) try {attempt+1}: {err}")
+        except Exception as e:
+            if "Stopped by user" in str(e):
+                raise
+            err = str(e)
+            logger.warning(f"N_m3u8DL-RE error: {e}")
 
-    # Fallback: ffmpeg direct copy
+    # Fallback: ffmpeg direct copy (with reconnect), 2 tries
     out_path = os.path.join(work_dir, f"{output_name}.mp4")
     fcmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+        "-reconnect_delay_max", "10",
         "-user_agent", ua,
         "-headers", "Origin: https://allen.in\r\nReferer: https://allen.in/\r\n",
         "-i", m3u8_url,
@@ -830,10 +839,15 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
         "-c", "copy", "-bsf:a", "aac_adtstoasc",
         out_path,
     ]
-    r = _run(fcmd, 3600, work_dir)
-    if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return out_path
-    raise RuntimeError(f"Download failed. RE: {err[-120:]} | ffmpeg: {(r.stderr or '')[-150:]}")
+    ferr = ""
+    for attempt in range(2):
+        r = _run(fcmd, 3600, work_dir)
+        if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+        ferr = (r.stderr or r.stdout or "").strip()
+    if "403" in ferr or "Forbidden" in ferr:
+        raise RuntimeError("Download failed: lecture link expired (403). Batch dobara chalao, naya link milega.")
+    raise RuntimeError(f"Download failed. RE: {err[-120:]} | ffmpeg: {ferr[-200:]}")
 
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
