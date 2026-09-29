@@ -690,7 +690,41 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
 
-async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption):
+def prepare_video_for_upload(source_path):
+    """Burn the channel watermark into the video and create its Telegram cover."""
+    stem, _ = os.path.splitext(source_path)
+    video_path = stem + ".watermarked.mp4"
+    thumb_path = stem + ".cover.jpg"
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    # A text watermark is independent of external logo URLs or expired media links.
+    label = ("drawtext=fontfile=" + font + ":text=courierWell:"
+             "fontcolor=white@0.80:fontsize=h/36:"
+             "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
+           "-map", "0:v:0", "-map", "0:a:0?", "-vf", label,
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-c:a", "copy", "-movflags", "+faststart", video_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
+            raise RuntimeError(f"Video watermark failed: {result.stderr[-300:]}")
+        # Extract a frame from the watermarked video: cover and video match.
+        for seek in ("2", "0"):
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", seek,
+                 "-i", video_path, "-frames:v", "1", "-vf", "scale=640:-2",
+                 "-q:v", "3", thumb_path], capture_output=True, text=True, timeout=90)
+            if result.returncode == 0 and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+                return video_path, thumb_path
+        raise RuntimeError(f"Video thumbnail failed: {result.stderr[-300:]}")
+    except Exception:
+        for path in (video_path, thumb_path):
+            if os.path.exists(path):
+                os.remove(path)
+        raise
+
+
+async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption, thumb_path=None):
     """Native async upload (tgcrypto) with FloodWait auto-retry."""
     from pyrogram.errors import FloodWait
     is_video = file_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov"))
@@ -698,7 +732,7 @@ async def async_upload_to_telegram(app_client, target_chat_id, file_path, captio
         try:
             if is_video:
                 return await app_client.send_video(chat_id=target_chat_id, video=file_path,
-                                                   caption=caption, supports_streaming=True)
+                                                   caption=caption, supports_streaming=True, thumb=thumb_path)
             return await app_client.send_document(chat_id=target_chat_id, document=file_path,
                                                   caption=caption)
         except FloodWait as fw:
@@ -892,6 +926,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             f"({MAX_PARALLEL_DOWNLOADS} parallel downloads, {DL_THREADS} threads each)</i></blockquote>")
 
         queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + 1)
+        # Bound downloaded files too: a slow first lecture must not fill the disk
+        # while later parallel downloads complete ahead of it.
+        slots = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS + 1)
         index_iter = iter(list(enumerate(pending, start=1)))
         lock = asyncio.Lock()
 
@@ -901,58 +938,75 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         async def downloader():
             nonlocal failed
             while running():
+                await slots.acquire()
                 async with lock:
                     nxt = next(index_iter, None)
                 if nxt is None:
+                    slots.release()
                     return
                 idx, item = nxt
                 title = item.get("title") or f"Lecture_{idx}"
                 clean = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()[:70] or f"item_{idx}"
                 clean = f"{idx}_{clean}"
                 url = item.get("url")
-                if not url:
-                    continue
+                path = None
                 try:
+                    if not url:
+                        raise ValueError("Lecture URL missing")
                     if ".m3u8" in url:
                         path = await async_download_m3u8(url, clean, token, work_dir)
                     else:
                         ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
                         path = await asyncio.to_thread(download_file, url, os.path.join(work_dir, clean + ext))
-                    await queue.put((idx, item, title, path))
                 except Exception as e:
                     failed += 1
                     logger.error(f"Download failed ({title}): {e}")
                     await message.reply_text(
                         f"<blockquote><i>⚠️ Skipped: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                # Even failures have an index, so the uploader can advance in order.
+                await queue.put((idx, item, title, path))
 
         async def uploader():
             nonlocal ok, failed
-            finished = 0
-            while finished < total and running():
+            next_index = 1
+            ready = {}
+            while next_index <= total and running():
                 try:
-                    idx, item, title, path = await asyncio.wait_for(queue.get(), timeout=5)
+                    result = await asyncio.wait_for(queue.get(), timeout=5)
+                    ready[result[0]] = result
                 except asyncio.TimeoutError:
                     if all(d.done() for d in downloaders) and queue.empty():
                         return
                     continue
-                try:
-                    caption = f"<blockquote><i><b>{title}</b>\n\nAllen Auto-Downloader ({idx}/{total})</i></blockquote>"
-                    await async_upload_to_telegram(app, target_chat_id, path, caption)
-                    mark_done(item["id"], done)
-                    ok += 1
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Upload failed ({title}): {e}")
-                    await message.reply_text(
-                        f"<blockquote><i>⚠️ Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
-                finally:
-                    finished += 1
-                    if os.path.exists(path):
-                        try:
-                            os.remove(path)
-                        except Exception:
-                            pass
-                    gc.collect()
+                while next_index in ready and running():
+                    idx, item, title, path = ready.pop(next_index)
+                    next_index += 1
+                    video_path = thumb_path = None
+                    try:
+                        if path is None:
+                            continue
+                        caption = f"<blockquote><i><b>{title}</b></i></blockquote>"
+                        upload_path = path
+                        if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                            video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
+                            upload_path = video_path
+                        await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path)
+                        mark_done(item["id"], done)
+                        ok += 1
+                    except Exception as e:
+                        failed += 1
+                        logger.error(f"Upload failed ({title}): {e}")
+                        await message.reply_text(
+                            f"<blockquote><i>⚠️ Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                    finally:
+                        for output in (path, video_path, thumb_path):
+                            if output and os.path.exists(output):
+                                try:
+                                    os.remove(output)
+                                except Exception:
+                                    pass
+                        slots.release()
+                        gc.collect()
 
         downloaders = [asyncio.create_task(downloader()) for _ in range(MAX_PARALLEL_DOWNLOADS)]
         up = asyncio.create_task(uploader())
