@@ -166,8 +166,8 @@ app = Client(
     api_id=TG_API_ID,
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
-    workers=64,
-    max_concurrent_transmissions=16,
+    workers=32,
+    max_concurrent_transmissions=8,
     parse_mode=enums.ParseMode.HTML
 )
 
@@ -273,8 +273,8 @@ SUBJECT_ALIASES = {
     "mathematics": "Mathematics",
 }
 # speed tuning (env-overridable)
-DL_THREADS = os.getenv("DL_THREADS", "96")
-MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "8"))
+DL_THREADS = os.getenv("DL_THREADS", "48")
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "3"))
 
 
 def normalize_subject(raw):
@@ -847,13 +847,20 @@ def prepare_video_for_upload(source_path):
     # A text watermark is independent of external logo URLs or expired media links.
     label = ("drawtext=fontfile=" + font + ":text=courierWell:"
              "fontcolor=white@0.80:fontsize=h/36:"
-             "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
+             "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24,"
+             "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p")
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
            "-map", "0:v:0", "-map", "0:a:0?", "-vf", label,
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-           "-c:a", "copy", "-movflags", "+faststart", video_path]
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+           "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", video_path]
     try:
         result = _run(cmd, 7200, os.path.dirname(source_path))
+        if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
+            # Retry once with plain settings before giving up.
+            simple = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
+                      "-vf", label, "-c:v", "libx264", "-preset", "ultrafast",
+                      "-pix_fmt", "yuv420p", "-c:a", "aac", video_path]
+            result = _run(simple, 7200, os.path.dirname(source_path))
         if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
             raise RuntimeError(f"Video watermark failed: {result.stderr[-300:]}")
         # Extract a frame from the watermarked video: cover and video match.
@@ -1113,7 +1120,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             f"<blockquote><i>🚀 <b>{total} new items</b> (total {len(items)}) — turbo mode ON "
             f"({MAX_PARALLEL_DOWNLOADS} parallel downloads, {DL_THREADS} threads each)</i></blockquote>")
 
-        UPLOAD_PARALLELISM = int(os.getenv("UPLOAD_PARALLELISM", "6"))
+        UPLOAD_PARALLELISM = int(os.getenv("UPLOAD_PARALLELISM", "3"))
         queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + UPLOAD_PARALLELISM + 2)
         # Bound downloaded files too: a slow first lecture must not fill the disk
         # while later parallel downloads complete ahead of it.
