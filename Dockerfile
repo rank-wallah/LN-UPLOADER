@@ -10,11 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install high-performance binary N_m3u8DL-RE
-RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.0-beta/N_m3u8DL-RE_Beta_linux-x64_20230628.tar.gz -O re.tar.gz \
+RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-x64_20260629.tar.gz -O re.tar.gz \
     && tar -xvf re.tar.gz \
-    && mv N_m3u8DL-RE_Beta_linux-x64/N_m3u8DL-RE /usr/local/bin/ \
+    && mv N_m3u8DL-RE /usr/local/bin/ \
     && chmod +x /usr/local/bin/N_m3u8DL-RE \
-    && rm -rf re.tar.gz N_m3u8DL-RE_Beta_linux-x64
+    && rm -rf re.tar.gz
 
 WORKDIR /app
 
