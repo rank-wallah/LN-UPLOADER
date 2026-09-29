@@ -893,6 +893,39 @@ def prepare_video_for_upload(source_path):
         raise
 
 
+TG_UPLOAD_LIMIT = 1950 * 1024 * 1024  # stay safely under Telegram's 2000 MB cap
+
+def reduce_video_size(source_path, duration=0):
+    """Re-encode only when the file is over the Telegram limit; sized to fit."""
+    if not os.path.isfile(source_path) or os.path.getsize(source_path) <= TG_UPLOAD_LIMIT:
+        return source_path
+    if not duration:
+        duration, _, _ = probe_video(source_path)
+    if not duration or duration <= 0:
+        duration = 3600
+    # Target total bitrate so the result lands under the limit (90% safety margin).
+    target_bits = TG_UPLOAD_LIMIT * 0.90 * 8
+    total_kbps = int(target_bits / duration / 1000)
+    audio_kbps = 96
+    video_kbps = max(total_kbps - audio_kbps, 300)
+    stem, _ = os.path.splitext(source_path)
+    out_path = stem + ".reduced.mp4"
+    for vf in ("scale='min(1280,iw)':-2", "scale=trunc(iw/2)*2:trunc(ih/2)*2"):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path,
+               "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+               "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{video_kbps}k",
+               "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+               "-movflags", "+faststart", out_path]
+        result = _run(cmd, 7200, os.path.dirname(source_path))
+        if result.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            if os.path.getsize(out_path) <= TG_UPLOAD_LIMIT:
+                return out_path
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    raise RuntimeError("Video 2000MB se badi hai aur compress karke bhi fit nahi hui.")
+
+
 async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption, thumb_path=None, duration=0, width=0, height=0):
     """Native async upload (tgcrypto) with FloodWait auto-retry."""
     from pyrogram.errors import FloodWait
@@ -1227,6 +1260,12 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     dur = w = h = 0
                     if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         dur, w, h = await asyncio.to_thread(probe_video, upload_path)
+                        if os.path.getsize(upload_path) > TG_UPLOAD_LIMIT:
+                            reduced = await asyncio.to_thread(reduce_video_size, upload_path, dur)
+                            if reduced != upload_path:
+                                upload_path = reduced
+                                video_path = reduced
+                                dur, w, h = await asyncio.to_thread(probe_video, upload_path)
                     caption = build_caption(item, upload_path, dur)
                     await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path, dur, w, h)
                     mark_done(item["id"], done)
