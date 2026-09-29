@@ -366,7 +366,7 @@ async def purge_uploaded_messages(client):
     return total
 
 
-def build_caption(item, file_path):
+def build_caption(item, file_path, duration=0):
     """Caption format:
     [🎥]Vid Id : <content_id>
     File Title : <lecture title + real extension>
@@ -392,17 +392,11 @@ def build_caption(item, file_path):
     else:
         topic_line = subject or topic or "Topic"
 
-    caption = "\n".join([
-        f"[🎥]Vid Id : {vid}",
-        "",
-        f"File Title : {file_title}",
-        "",
-        f"Batch Name : {batch}",
-        "",
-        f"Topic Name : {topic_line}",
-        "",
-        "Extracted By ➤ Courier Well",
-    ])
+    lines = [f"File Title : {file_title}"]
+    if duration:
+        lines.append(f"Duration : {_fmt_duration(duration)}")
+    lines += [f"Batch Name : {batch}", f"Topic Name : {topic_line}", "Extracted By ➤ Courier Well"]
+    caption = "\n".join(lines)
     return html.escape(caption)
 
 
@@ -737,6 +731,60 @@ def _find_output(work_dir, output_name):
     return best
 
 
+RUNNING_PROCS = {}  # work_dir -> set(Popen) so /stop can kill running downloads/encodes
+STOPPED_DIRS = set()
+
+
+def _run(cmd, timeout, work_dir):
+    """subprocess.run replacement that /stop can kill instantly."""
+    key = os.path.abspath(work_dir)
+    if key in STOPPED_DIRS:
+        raise RuntimeError("Stopped by user")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    RUNNING_PROCS.setdefault(key, set()).add(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+    finally:
+        RUNNING_PROCS.get(key, set()).discard(proc)
+    if key in STOPPED_DIRS:
+        raise RuntimeError("Stopped by user")
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def kill_job_processes(work_dir):
+    key = os.path.abspath(work_dir)
+    STOPPED_DIRS.add(key)
+    for proc in list(RUNNING_PROCS.get(key, set())):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _fmt_duration(sec):
+    sec = int(sec or 0)
+    h, r = divmod(sec, 3600)
+    m, s_ = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s_:02d}"
+
+
+def probe_video(path):
+    """Return (duration_seconds, width, height) via ffprobe."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height:format=duration",
+                            "-of", "json", path], capture_output=True, text=True, timeout=60)
+        d = json.loads(r.stdout or "{}")
+        st = (d.get("streams") or [{}])[0]
+        dur = float((d.get("format") or {}).get("duration") or 0)
+        return int(dur), int(st.get("width") or 0), int(st.get("height") or 0)
+    except Exception:
+        return 0, 0, 0
+
+
 def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     """Allen CDN URLs are already signed (hdnts). Sending the API Bearer token
     to the CDN makes it reject the request, so it is NOT sent. Falls back to
@@ -761,13 +809,15 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     ]
     err = ""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        r = _run(cmd, 3600, work_dir)
         out = _find_output(work_dir, output_name)
         if r.returncode == 0 and out:
             return out
         err = (r.stderr or r.stdout or "")[-300:]
         logger.warning(f"N_m3u8DL-RE failed ({r.returncode}): {err}")
     except Exception as e:
+        if "Stopped by user" in str(e):
+            raise
         err = str(e)
         logger.warning(f"N_m3u8DL-RE error: {e}")
 
@@ -782,7 +832,7 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
         "-c", "copy", "-bsf:a", "aac_adtstoasc",
         out_path,
     ]
-    r = subprocess.run(fcmd, capture_output=True, text=True, timeout=3600)
+    r = _run(fcmd, 3600, work_dir)
     if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
     raise RuntimeError(f"Download failed. RE: {err[-120:]} | ffmpeg: {(r.stderr or '')[-150:]}")
@@ -805,7 +855,7 @@ def prepare_video_for_upload(source_path):
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-c:a", "copy", "-movflags", "+faststart", video_path]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = _run(cmd, 7200, os.path.dirname(source_path))
         if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
             raise RuntimeError(f"Video watermark failed: {result.stderr[-300:]}")
         # Extract a frame from the watermarked video: cover and video match.
@@ -824,7 +874,7 @@ def prepare_video_for_upload(source_path):
         raise
 
 
-async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption, thumb_path=None):
+async def async_upload_to_telegram(app_client, target_chat_id, file_path, caption, thumb_path=None, duration=0, width=0, height=0):
     """Native async upload (tgcrypto) with FloodWait auto-retry."""
     from pyrogram.errors import FloodWait
     is_video = file_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov"))
@@ -832,7 +882,8 @@ async def async_upload_to_telegram(app_client, target_chat_id, file_path, captio
         try:
             if is_video:
                 msg = await app_client.send_video(chat_id=target_chat_id, video=file_path,
-                                                  caption=caption, supports_streaming=True, thumb=thumb_path)
+                                                  caption=caption, supports_streaming=True, thumb=thumb_path,
+                                                  duration=duration or 0, width=width or 0, height=height or 0)
             else:
                 msg = await app_client.send_document(chat_id=target_chat_id, document=file_path,
                                                      caption=caption)
@@ -1012,8 +1063,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     """Pipeline: parallel downloads feeding a single uploader -> max speed per job.
     Multiple jobs (different batches / channels) can run at the same time."""
     key = _job_key(target_chat_id, batch_id, subject)
-    ACTIVE_JOBS[key] = {"running": True, "chat": message.chat.id}
     work_dir = os.path.join(DOWNLOAD_DIR, str(abs(hash(key)) % 10**8))
+    STOPPED_DIRS.discard(os.path.abspath(work_dir))
+    ACTIVE_JOBS[key] = {"running": True, "chat": message.chat.id, "work_dir": work_dir, "tasks": []}
+    chapter_index = []  # (chapter title, message link)
+    last_chapter = None
     os.makedirs(work_dir, exist_ok=True)
     done = load_done()
     ok = failed = 0
@@ -1069,6 +1123,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
                         path = await asyncio.to_thread(download_file, url, os.path.join(work_dir, clean + ext))
                 except Exception as e:
+                    if not running():
+                        slots.release()
+                        return
                     failed += 1
                     logger.error(f"Download failed ({title}): {e}")
                     await message.reply_text(
@@ -1077,7 +1134,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 await queue.put((idx, item, title, path))
 
         async def uploader():
-            nonlocal ok, failed
+            nonlocal ok, failed, last_chapter
             next_index = 1
             ready = {}
             while next_index <= total and running():
@@ -1099,8 +1156,27 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                             video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
                             upload_path = video_path
-                        caption = build_caption(item, upload_path)
-                        await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path)
+                        subj = str(item.get("subject") or "").strip()
+                        topic = str(item.get("topic") or "").strip()
+                        chap = f"{subj} - {topic}" if subj and topic and topic != subj else (topic or subj or "Chapter")
+                        if chap != last_chapter:
+                            last_chapter = chap
+                            try:
+                                cm = await app.send_message(target_chat_id,
+                                                            f"<b>📌 {html.escape(chap)}</b>")
+                                log_uploaded_message(target_chat_id, getattr(cm, "id", None))
+                                chapter_index.append((chap, getattr(cm, "link", None)))
+                                try:
+                                    await cm.pin(disable_notification=True)
+                                except Exception as pe:
+                                    logger.warning(f"Pin failed: {pe}")
+                            except Exception as ce:
+                                logger.warning(f"Chapter header failed: {ce}")
+                        dur = w = h = 0
+                        if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                            dur, w, h = await asyncio.to_thread(probe_video, upload_path)
+                        caption = build_caption(item, upload_path, dur)
+                        await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path, dur, w, h)
                         mark_done(item["id"], done)
                         ok += 1
                     except Exception as e:
@@ -1120,8 +1196,33 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
 
         downloaders = [asyncio.create_task(downloader()) for _ in range(MAX_PARALLEL_DOWNLOADS)]
         up = asyncio.create_task(uploader())
+        ACTIVE_JOBS[key]["tasks"] = downloaders + [up]
         await asyncio.gather(*downloaders, return_exceptions=True)
-        await up
+        try:
+            await up
+        except asyncio.CancelledError:
+            pass
+
+        stopped = not running()
+        if chapter_index:
+            rows = []
+            for n, (chap, link) in enumerate(chapter_index, start=1):
+                name = html.escape(chap)
+                rows.append(f'{n}. <a href="{link}">{name}</a>' if link else f"{n}. {name}")
+            head = "<b>📚 Chapter Index</b>" + (" (stopped)" if stopped else "")
+            chunk = head
+            for row in rows:
+                if len(chunk) + len(row) + 1 > 3900:
+                    im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
+                    log_uploaded_message(target_chat_id, getattr(im, "id", None))
+                    chunk = head + " (contd.)"
+                chunk += "\n" + row
+            im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
+            log_uploaded_message(target_chat_id, getattr(im, "id", None))
+        if stopped:
+            await message.reply_text(
+                f"<blockquote><i>🛑 Stopped. Uploaded: {ok} | Failed: {failed}</i></blockquote>")
+            return
 
         await message.reply_text(
             f"<blockquote><i>✅ <b>Done!</b> Uploaded: {ok} | Failed: {failed}\n"
@@ -1281,6 +1382,11 @@ async def handle_stop(client: Client, message: Message):
     for k, v in list(ACTIVE_JOBS.items()):
         if v.get("running") and (v.get("chat") == message.chat.id or message.from_user and message.from_user.id == OWNER_ID):
             v["running"] = False
+            if v.get("work_dir"):
+                kill_job_processes(v["work_dir"])
+            for t in v.get("tasks") or []:
+                if not t.done():
+                    t.cancel()
             stopped += 1
     if stopped:
         await message.reply_text(f"<blockquote><i>🛑 {stopped} job(s) rok diye.</i></blockquote>")
