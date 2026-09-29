@@ -1095,11 +1095,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     try:
                         if path is None:
                             continue
-                            upload_path = path
-                            if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
-                                video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
-                                upload_path = video_path
-                            caption = build_caption(item, upload_path)
+                        upload_path = path
+                        if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                            video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
+                            upload_path = video_path
+                        caption = build_caption(item, upload_path)
                         await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path)
                         mark_done(item["id"], done)
                         ok += 1
