@@ -10,6 +10,8 @@ import subprocess
 import logging
 import uuid
 import socket
+import re
+import html
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
@@ -307,6 +309,103 @@ def mark_done(content_id, done_set):
         logger.warning(f"Could not persist progress: {e}")
 
 
+# ---- Uploaded-message tracking + auto-delete on new login ----
+UPLOAD_LOG_FILE = "uploaded_messages.json"
+
+
+def load_upload_log():
+    if os.path.exists(UPLOAD_LOG_FILE):
+        try:
+            with open(UPLOAD_LOG_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): [int(m) for m in v if m] for k, v in data.items()
+                        if isinstance(v, list)}
+        except Exception:
+            pass
+    return {}
+
+
+def save_upload_log(log):
+    try:
+        with open(UPLOAD_LOG_FILE, "w") as f:
+            json.dump(log, f)
+    except Exception as e:
+        logger.warning(f"Could not persist upload log: {e}")
+
+
+def log_uploaded_message(chat_id, message_id):
+    if not message_id:
+        return
+    log = load_upload_log()
+    bucket = log.setdefault(str(chat_id), [])
+    if message_id not in bucket:
+        bucket.append(message_id)
+    save_upload_log(log)
+
+
+async def purge_uploaded_messages(client):
+    """Naya /login => pehle upload kiye saare channel messages delete (revoke=True)."""
+    log = load_upload_log()
+    total = 0
+    for chat_id, ids in log.items():
+        if not chat_id.lstrip("-").isdigit() or not ids:
+            continue
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            try:
+                await client.delete_messages(int(chat_id), chunk, revoke=True)
+                total += len(chunk)
+            except Exception as e:
+                logger.warning(f"Could not delete uploads in chat {chat_id}: {e}")
+    for stale in (UPLOAD_LOG_FILE, DONE_FILE):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    return total
+
+
+def build_caption(item, file_path):
+    """Caption format:
+    [🎥]Vid Id : <content_id>
+    File Title : <lecture title + real extension>
+    Batch Name : <course name>
+    Topic Name : <Subject - Topic>
+    Extracted By ➤ Courier Well"""
+    raw = str(item.get("title") or "Lecture")
+    m = re.match(r"^\[[^\]]+\]\s*", raw)
+    file_title = raw[m.end():].strip() if m else raw.strip()
+    file_title = re.sub(r'[\\/:*?"<>|]+', " - ", file_title).strip() or "Lecture"
+    ext = os.path.splitext(file_path)[1] or ""
+    file_title = f"{file_title}{ext}"
+
+    vid = str(item.get("id") or "").strip()
+    if vid.startswith("http"):
+        vid = vid.split("/")[-1].split("?")[0] or vid
+
+    batch = str(item.get("batch") or "Allen Batch").strip() or "Allen Batch"
+    subject = str(item.get("subject") or "").strip()
+    topic = str(item.get("topic") or "").strip()
+    if topic and topic != subject:
+        topic_line = f"{subject} - {topic}" if subject else topic
+    else:
+        topic_line = subject or topic or "Topic"
+
+    caption = "\n".join([
+        f"[🎥]Vid Id : {vid}",
+        "",
+        f"File Title : {file_title}",
+        "",
+        f"Batch Name : {batch}",
+        "",
+        f"Topic Name : {topic_line}",
+        "",
+        "Extracted By ➤ Courier Well",
+    ])
+    return html.escape(caption)
+
+
 def allen_get_page(page_url, token):
     r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
                       headers=allen_content_headers(token), timeout=30)
@@ -501,12 +600,13 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
     discovered_subject_urls = _discover_subject_urls(token)
     logger.info("Allen navigation discovery found %s subject URL(s)", len(discovered_subject_urls))
 
-    def _add(prefix, found):
+    def _add(prefix, found, batch_name, subject, topic):
         for it in found:
             if it["id"] in seen:
                 continue
             seen.add(it["id"])
-            items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"]})
+            items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"],
+                          "batch": batch_name, "subject": subject, "topic": topic})
 
     for course in courses:
         enrolled_batches = list(dict.fromkeys(str(v) for v in (course.get("enrolled_batches") or []) if v))
@@ -593,7 +693,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             if not working_context:
                 logger.warning(f"subject {sname} returned no chapters/content: {last_error or 'empty page'}")
                 continue
-            _add(f"[{cname} | {sname}]", contents)
+            _add(f"[{cname} | {sname}]", contents, cname, sname, sname)
             batch_ids, selected_list, taxonomy_id, stream = working_context
             seen_chapters = set()
             for ch in chapters:
@@ -613,7 +713,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                     continue
                 tcontents, tch = [], []
                 _walk_page(tpage, tcontents, tch)
-                _add(f"[{sname} | {ch.get('topic_name')}]", tcontents)
+                _add(f"[{sname} | {ch.get('topic_name')}]", tcontents, cname, sname, ch.get("topic_name"))
     return items
 
 
@@ -731,10 +831,13 @@ async def async_upload_to_telegram(app_client, target_chat_id, file_path, captio
     for attempt in range(5):
         try:
             if is_video:
-                return await app_client.send_video(chat_id=target_chat_id, video=file_path,
-                                                   caption=caption, supports_streaming=True, thumb=thumb_path)
-            return await app_client.send_document(chat_id=target_chat_id, document=file_path,
-                                                  caption=caption)
+                msg = await app_client.send_video(chat_id=target_chat_id, video=file_path,
+                                                  caption=caption, supports_streaming=True, thumb=thumb_path)
+            else:
+                msg = await app_client.send_document(chat_id=target_chat_id, document=file_path,
+                                                     caption=caption)
+            log_uploaded_message(target_chat_id, getattr(msg, "id", None))
+            return msg
         except FloodWait as fw:
             wait = int(getattr(fw, "value", 10) or 10)
             logger.warning(f"FloodWait {wait}s (attempt {attempt + 1})")
@@ -797,7 +900,14 @@ async def handle_login(client: Client, message: Message):
 
     try:
         token = await asyncio.to_thread(allen_login_idpass, username, password)
-        await status_msg.edit_text("<blockquote><i>🔎 Login successful. Ab actual lectures verify ho rahe hain...</i></blockquote>")
+        try:
+            purged = await purge_uploaded_messages(app)
+            logger.info(f"Auto-delete on new login: {purged} message(s) removed")
+        except Exception as pe:
+            logger.warning(f"Auto-delete failed: {pe}")
+            purged = 0
+        purged_note = f"\n🗑️ Purane {purged} uploads channel se delete ho gaye." if purged else ""
+        await status_msg.edit_text(f"<blockquote><i>🔎 Login successful. Ab actual lectures verify ho rahe hain...{purged_note}</i></blockquote>")
         sample = await asyncio.to_thread(fetch_batch_contents, None, token, "Physics")
         if not sample:
             await status_msg.edit_text(
@@ -985,11 +1095,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     try:
                         if path is None:
                             continue
-                        caption = f"<blockquote><i><b>{title}</b></i></blockquote>"
-                        upload_path = path
-                        if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
-                            video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
-                            upload_path = video_path
+                            upload_path = path
+                            if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
+                                video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
+                                upload_path = video_path
+                            caption = build_caption(item, upload_path)
                         await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path)
                         mark_done(item["id"], done)
                         ok += 1
