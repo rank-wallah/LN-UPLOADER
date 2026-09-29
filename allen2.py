@@ -368,7 +368,7 @@ def _walk_page(node, contents, chapters):
             _walk_page(value, contents, chapters)
 
 
-def _allen_internal_urls(node, wanted_uri=None):
+def _allen_internal_urls(node, wanted_uri=None, with_labels=False):
     """Collect exact internal page URLs emitted by Allen's page renderer."""
     found = []
     if isinstance(node, dict):
@@ -383,14 +383,27 @@ def _allen_internal_urls(node, wanted_uri=None):
                 if wanted_uri is None or uri.split("?", 1)[0] == wanted_uri:
                     if isinstance(query, dict) and query:
                         clean = {str(k): str(v) for k, v in query.items() if v is not None}
-                        found.append(uri.split("?", 1)[0] + "?" + urlencode(clean))
+                        page_url = uri.split("?", 1)[0] + "?" + urlencode(clean)
                     else:
-                        found.append(uri)
+                        page_url = uri
+                    if with_labels:
+                        tracking = action.get("tracking_params") or {}
+                        current = tracking.get("current") or {}
+                        label = (current.get("subject_name") or data.get("title") or
+                                 node.get("title") or node.get("name") or "")
+                        found.append({"url": page_url, "label": str(label)})
+                    else:
+                        found.append(page_url)
         for value in node.values():
-            found.extend(_allen_internal_urls(value, wanted_uri))
+            found.extend(_allen_internal_urls(value, wanted_uri, with_labels))
     elif isinstance(node, list):
         for value in node:
-            found.extend(_allen_internal_urls(value, wanted_uri))
+            found.extend(_allen_internal_urls(value, wanted_uri, with_labels))
+    if with_labels:
+        unique = {}
+        for item in found:
+            unique[item["url"]] = item
+        return list(unique.values())
     return list(dict.fromkeys(found))
 
 
@@ -407,12 +420,15 @@ def _discover_subject_urls(token):
         except Exception as exc:
             logger.warning("Allen navigation discovery skipped %s: %s", page_url, exc)
             continue
-        discovered.extend(_allen_internal_urls(page, "/subject-details"))
+        discovered.extend(_allen_internal_urls(page, "/subject-details", with_labels=True))
         for next_url in _allen_internal_urls(page):
             path = next_url.split("?", 1)[0]
             if path in ("/library-web", "/library", "/explore") and next_url not in visited:
                 queue.append(next_url)
-    return list(dict.fromkeys(discovered))
+    unique = {}
+    for item in discovered:
+        unique[item["url"]] = item
+    return list(unique.values())
 
 
 def _query_value(page_url, key):
@@ -530,9 +546,14 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
             contents, chapters = [], []
             working_context = None
             last_error = None
-            exact_urls = [url for url in discovered_subject_urls
-                          if _query_value(url, "selected_course_id") == str(cid)
-                          and _query_value(url, "subject_id") == str(sid)]
+            # Subject IDs and taxonomy IDs are account/session specific. Match
+            # the server-provided subject label, then replay its exact URL.
+            wanted_names = {sname.lower()}
+            if sname == "Mathematics":
+                wanted_names.add("maths")
+            exact_urls = [item["url"] for item in discovered_subject_urls
+                          if _query_value(item["url"], "selected_course_id") == str(cid)
+                          and item.get("label", "").strip().lower() in wanted_names]
             if not wants_all:
                 exact_urls = [url for url in exact_urls if str(batch_id) in
                               (_query_value(url, "batch_id") + "," +
