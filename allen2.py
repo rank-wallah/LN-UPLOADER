@@ -167,7 +167,7 @@ app = Client(
     api_hash=TG_API_HASH,
     bot_token=TG_BOT_TOKEN,
     workers=32,
-    max_concurrent_transmissions=8,
+    max_concurrent_transmissions=16,
     parse_mode=enums.ParseMode.HTML
 )
 
@@ -273,8 +273,18 @@ SUBJECT_ALIASES = {
     "mathematics": "Mathematics",
 }
 # speed tuning (env-overridable)
+def _cpu_count():
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+CPU_COUNT = _cpu_count()
+# Auto-scale with the Heroku dyno size: ~1 watermark job per 2 CPUs (min 3).
+AUTO_PARALLEL = max(3, min(16, CPU_COUNT // 2))
 DL_THREADS = os.getenv("DL_THREADS", "48")
-MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "3"))
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", str(AUTO_PARALLEL + 1)))
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", str(max(2, CPU_COUNT // AUTO_PARALLEL)))
 
 
 def normalize_subject(raw):
@@ -890,7 +900,7 @@ def prepare_video_for_upload(source_path):
                 "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
                 "-vf", video_filter, "-fps_mode", "vfr",
                 "-c:v", "libx264", "-preset", preset, "-crf", "26", "-tune", "fastdecode",
-                "-pix_fmt", "yuv420p", "-threads", "3",
+                "-pix_fmt", "yuv420p", "-threads", FFMPEG_THREADS,
                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
                 "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
                 video_path]
@@ -1200,7 +1210,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             f"<blockquote><i>🚀 <b>{total} new items</b> (total {len(items)}) — turbo mode ON "
             f"({MAX_PARALLEL_DOWNLOADS} parallel downloads, {DL_THREADS} threads each)</i></blockquote>")
 
-        UPLOAD_PARALLELISM = int(os.getenv("UPLOAD_PARALLELISM", "3"))
+        UPLOAD_PARALLELISM = int(os.getenv("UPLOAD_PARALLELISM", str(AUTO_PARALLEL)))
         queue = asyncio.Queue(maxsize=MAX_PARALLEL_DOWNLOADS + UPLOAD_PARALLELISM + 2)
         # Bound downloaded files too: a slow first lecture must not fill the disk
         # while later parallel downloads complete ahead of it.
