@@ -923,6 +923,20 @@ async def handle_auth(client: Client, message: Message):
     except ValueError:
         await message.reply_text("<blockquote><i>⚠️ Invalid User ID.</i></blockquote>")
 
+
+def _schedule_delete(chat_id, message_id, delay=20):
+    """Delete a message after `delay` seconds (best-effort, never raises)."""
+    async def _del():
+        try:
+            await asyncio.sleep(delay)
+            await app.delete_messages(chat_id, message_id)
+        except Exception as e:
+            logger.warning(f"Auto-delete msg {message_id} failed: {e}")
+    try:
+        asyncio.get_running_loop().create_task(_del())
+    except RuntimeError:
+        pass
+
 @app.on_message(filters.command("login") & (filters.group | filters.channel | filters.private))
 async def handle_login(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else "Unknown"
@@ -945,6 +959,10 @@ async def handle_login(client: Client, message: Message):
     if not username or not password:
         await message.reply_text("<blockquote><i>⚠️ Username and password cannot be empty.</i></blockquote>")
         return
+    try:
+        await message.delete()  # credentials wali message turant hatao
+    except Exception as e:
+        logger.warning(f"/login command delete failed: {e}")
     status_msg = await message.reply_text("<blockquote><i>🔑 Authenticating directly with Allen Servers...</i></blockquote>")
 
     try:
@@ -963,14 +981,17 @@ async def handle_login(client: Client, message: Message):
                 "<blockquote><i>⚠️ <b>Login valid hai, lekin Allen ne lecture page empty bheja.</b>\n"
                 "Session save ho gaya; dobara login karne ki zarurat nahi. "
                 "Course mapping abhi match nahi hui.</i></blockquote>")
+            _schedule_delete(status_msg.chat.id, status_msg.id)
             return
         await status_msg.edit_text(
             f"<blockquote><i>🎉 <b>Login + Lecture Test Successful!</b>\n\n"
             f"✅ {len(sample)} Physics items mile. Session saved hai.\n"
             "Ab <code>/mybatches</code> ya <code>/batch &lt;ID&gt; physics</code> chalao.</i></blockquote>")
+        _schedule_delete(status_msg.chat.id, status_msg.id)
     except Exception as e:
         logger.error(f"Login pipeline failed: {e}")
         await status_msg.edit_text(f"<blockquote><i>❌ <b>Login Failed:</b>\n<code>{str(e)}</code></i></blockquote>")
+        _schedule_delete(status_msg.chat.id, status_msg.id)
 
 
 @app.on_message(filters.command("token") & (filters.group | filters.channel | filters.private))
@@ -991,6 +1012,10 @@ async def handle_token(client: Client, message: Message):
         return
 
     token = args[1].strip()
+    try:
+        await message.delete()  # token wali message turant hatao
+    except Exception as e:
+        logger.warning(f"/token command delete failed: {e}")
     if token.count(".") != 2:
         await message.reply_text("<blockquote><i>⚠️ Ye valid JWT token nahi lagta. Poora token paste karo.</i></blockquote>")
         return
@@ -1013,7 +1038,8 @@ async def handle_token(client: Client, message: Message):
                    "refresh_token": "", "device_id": get_allen_device_id(),
                    "host": "api.allen-live.in"}
         save_allen_session(session)
-        await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
+        ok_msg = await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
+        _schedule_delete(ok_msg.chat.id, ok_msg.id)
     except Exception as e:
         logger.error(f"Token save failed: {e}")
         await message.reply_text(f"<blockquote><i>❌ <b>Token Error:</b> <code>{str(e)}</code></i></blockquote>")
