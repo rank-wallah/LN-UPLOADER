@@ -425,6 +425,23 @@ def allen_get_page(page_url, token):
     return page_data
 
 
+def _content_section(action):
+    """Turn Allen's card_type into a short, stable channel/index section name."""
+    current = ((action.get("tracking_params") or {}).get("current") or {})
+    card_type = str(current.get("card_type") or "").lower()
+    if "live lecture" in card_type or "class notes" in card_type:
+        return "Live Lectures & Notes"
+    if "concept video" in card_type:
+        return "Concept Videos"
+    if "race" in card_type:
+        return "RACE & Solutions"
+    if "exercise" in card_type or "rpp" in card_type:
+        return "Exercises & Solutions"
+    if "study module" in card_type:
+        return "Study Modules"
+    return "Other Material"
+
+
 def _walk_page(node, contents, chapters):
     """Recursively collect playable contents and chapter/topic links from a page tree."""
     if isinstance(node, dict):
@@ -436,7 +453,8 @@ def _walk_page(node, contents, chapters):
                 if uri and title and str(uri).startswith("http"):
                     subtitle = node.get("subtitle") or ""
                     name = f"{str(subtitle)[:10]} {title}".strip() if subtitle else title
-                    contents.append({"id": d.get("content_id") or uri, "title": name, "url": uri})
+                    contents.append({"id": d.get("content_id") or uri, "title": name, "url": uri,
+                                      "section": _content_section(action)})
         action = node.get("action")
         if isinstance(action, dict):
             action_data = action.get("data") or {}
@@ -598,7 +616,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                 continue
             seen.add(it["id"])
             items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"],
-                          "batch": batch_name, "subject": subject, "topic": topic})
+                          "batch": batch_name, "subject": subject, "topic": topic,
+                          "section": it.get("section") or "Other Material"})
 
     for course in courses:
         enrolled_batches = list(dict.fromkeys(str(v) for v in (course.get("enrolled_batches") or []) if v))
@@ -1144,8 +1163,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     work_dir = os.path.join(DOWNLOAD_DIR, str(abs(hash(key)) % 10**8))
     STOPPED_DIRS.discard(os.path.abspath(work_dir))
     ACTIVE_JOBS[key] = {"running": True, "chat": message.chat.id, "work_dir": work_dir, "tasks": []}
-    chapter_index = []  # (chapter title, message link)
-    last_chapter = None
+    section_index = []  # (subject, chapter, section, message link)
+    announced_sections = {}
     os.makedirs(work_dir, exist_ok=True)
     done = load_done()
     ok = failed = 0
@@ -1212,17 +1231,44 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 # Even failures have an index, so the uploader can advance in order.
                 await queue.put((idx, item, title, path))
 
-        chapter_events = {}
-        chapter_lock = asyncio.Lock()
+        def item_group(item):
+            subj = str(item.get("subject") or "").strip()
+            topic = str(item.get("topic") or "").strip()
+            chapter = topic or subj or "Chapter"
+            section = str(item.get("section") or "Other Material").strip()
+            return subj, chapter, section
+
+        async def announce_group(item):
+            group = item_group(item)
+            if group in announced_sections:
+                return
+            subj, chapter, section = group
+            batch_name = str(item.get("batch") or "Allen Batch").strip()
+            heading = (f"<b>{html.escape(batch_name)}</b>\n"
+                       f"📚 <b>{html.escape(subj)} - {html.escape(chapter)}</b>\n\n"
+                       f"🔷 <b>{html.escape(section)}</b>")
+            try:
+                cm = await app.send_message(target_chat_id, heading)
+                log_uploaded_message(target_chat_id, getattr(cm, "id", None))
+                announced_sections[group] = getattr(cm, "link", None)
+                section_index.append((subj, chapter, section, getattr(cm, "link", None)))
+                try:
+                    await cm.pin(disable_notification=True)
+                except Exception as pe:
+                    logger.warning(f"Section pin failed: {pe}")
+            except Exception as ce:
+                announced_sections[group] = None
+                section_index.append((subj, chapter, section, None))
+                logger.warning(f"Section header failed: {ce}")
 
         async def uploader():
-            nonlocal ok, failed, last_chapter
+            nonlocal ok, failed
             next_index = 1
             ready = {}
             in_flight = set()
 
             async def upload_one(idx, item, title, path):
-                nonlocal ok, failed, last_chapter
+                nonlocal ok, failed
                 video_path = thumb_path = None
                 try:
                     if path is None:
@@ -1231,32 +1277,6 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
                         upload_path = video_path
-                    subj = str(item.get("subject") or "").strip()
-                    topic = str(item.get("topic") or "").strip()
-                    chap = f"{subj} - {topic}" if subj and topic and topic != subj else (topic or subj or "Chapter")
-                    async with chapter_lock:
-                        ev = chapter_events.get(chap)
-                        if ev is None:
-                            ev = asyncio.Event()
-                            chapter_events[chap] = ev
-                            first = True
-                        else:
-                            first = False
-                    if first:
-                        try:
-                            cm = await app.send_message(target_chat_id,
-                                                        f"<b>\U0001F4CC {html.escape(chap)}</b>")
-                            log_uploaded_message(target_chat_id, getattr(cm, "id", None))
-                            chapter_index.append((chap, getattr(cm, "link", None)))
-                            try:
-                                await cm.pin(disable_notification=True)
-                            except Exception as pe:
-                                logger.warning(f"Pin failed: {pe}")
-                        except Exception as ce:
-                            logger.warning(f"Chapter header failed: {ce}")
-                        ev.set()
-                    else:
-                        await ev.wait()
                     dur = w = h = 0
                     if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         dur, w, h = await asyncio.to_thread(probe_video, upload_path)
@@ -1300,6 +1320,13 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         continue
                     idx, item, title, path = ready.pop(next_index)
                     next_index += 1
+                    group = item_group(item)
+                    if group not in announced_sections:
+                        # Finish the old section before pinning the next heading.
+                        if in_flight:
+                            await asyncio.gather(*in_flight, return_exceptions=True)
+                            in_flight.clear()
+                        await announce_group(item)
                     in_flight.add(asyncio.create_task(upload_one(idx, item, title, path)))
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
@@ -1314,12 +1341,19 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             pass
 
         stopped = not running()
-        if chapter_index:
+        if section_index:
             rows = []
-            for n, (chap, link) in enumerate(chapter_index, start=1):
-                name = html.escape(chap)
-                rows.append(f'{n}. <a href="{link}">{name}</a>' if link else f"{n}. {name}")
-            head = "<b>📚 Chapter Index</b>" + (" (stopped)" if stopped else "")
+            last_index_chapter = None
+            chapter_no = 0
+            for subj, chapter, section, link in section_index:
+                chapter_key = (subj, chapter)
+                if chapter_key != last_index_chapter:
+                    chapter_no += 1
+                    rows.append(f"\n<b>{chapter_no}. 📚 {html.escape(subj)} - {html.escape(chapter)}</b>")
+                    last_index_chapter = chapter_key
+                label = "🔷 " + html.escape(section)
+                rows.append(f'   <a href="{link}">{label}</a>' if link else f"   {label}")
+            head = "<b>📚 Batch Index</b>" + (" (stopped)" if stopped else "")
             chunk = head
             for row in rows:
                 if len(chunk) + len(row) + 1 > 3900:
