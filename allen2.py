@@ -905,6 +905,28 @@ def prepare_video_for_upload(source_path):
                 "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
                 video_path]
 
+    if os.getenv("WATERMARK_MODE", "fast").lower() != "burn":
+        # FAST mode: no re-encode (stream copy) - watermark only on thumbnail.
+        try:
+            result = _run(["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-i", source_path,
+                           "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                           "-movflags", "+faststart", video_path], 1800, os.path.dirname(source_path))
+            if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
+                raise RuntimeError((result.stderr or "copy failed")[-300:])
+            for seek in ("5", "0"):
+                r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", seek, "-i", video_path,
+                                    "-frames:v", "1", "-vf",
+                                    "scale=640:-2,drawtext=text=courierWell:fontcolor=white@0.85:fontsize=28:"
+                                    "borderw=2:bordercolor=black@0.6:x=w-tw-16:y=16",
+                                    "-q:v", "3", thumb_path], capture_output=True, text=True, timeout=90)
+                if r.returncode == 0 and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+                    return video_path, thumb_path
+            return video_path, None
+        except Exception as e:
+            logger.warning(f"Fast mode failed, burning watermark instead: {e}")
+            if os.path.exists(video_path):
+                os.remove(video_path)
+
     try:
         result = _run(watermark_cmd(label), 7200, os.path.dirname(source_path))
         if result.returncode != 0 or not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
@@ -1192,6 +1214,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     os.makedirs(work_dir, exist_ok=True)
     done = load_done()
     ok = failed = 0
+    failed_titles = []
 
     try:
         items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject)
@@ -1250,8 +1273,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         return
                     failed += 1
                     logger.error(f"Download failed ({title}): {e}")
-                    await message.reply_text(
-                        f"<blockquote><i>⚠️ Skipped: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                    failed_titles.append(f"{title} (download)")
                 # Even failures have an index, so the uploader can advance in order.
                 await queue.put((idx, item, title, path))
 
@@ -1317,8 +1339,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 except Exception as e:
                     failed += 1
                     logger.error(f"Upload failed ({title}): {e}")
-                    await message.reply_text(
-                        f"<blockquote><i>\u26A0\uFE0F Upload fail: <b>{title}</b>\n<code>{str(e)[:150]}</code></i></blockquote>")
+                    failed_titles.append(f"{title} (upload)")
                 finally:
                     for output in (path, video_path, thumb_path):
                         if output and os.path.exists(output):
@@ -1392,6 +1413,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 f"<blockquote><i>🛑 Stopped. Uploaded: {ok} | Failed: {failed}</i></blockquote>")
             return
 
+        if failed_titles:
+            txt = "⚠️ Failed list:\n" + "\n".join(failed_titles[:40])
+            if len(failed_titles) > 40:
+                txt += f"\n...aur {len(failed_titles)-40}"
+            await message.reply_text(txt[:4000])
         await message.reply_text(
             f"<blockquote><i>✅ <b>Done!</b> Uploaded: {ok} | Failed: {failed}\n"
             f"Scope: {batch_id or 'ALL batches'} | {subject or 'All subjects'}</i></blockquote>")
