@@ -64,43 +64,69 @@ def is_user_authorized(user_id: int) -> bool:
 # ==========================================
 # SESSION MANAGEMENT (TOKEN & CREDS)
 # ==========================================
-def save_allen_session(data):
-    try:
-        with open(SESSION_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"Error saving session: {e}")
-
-def get_allen_session():
+def _load_session_store():
+    """Session store: {"default": {...}, "chats": {"<chat_id>": {...}}}.
+    Old flat single-session files are migrated automatically."""
     if os.path.exists(SESSION_FILE):
         try:
             with open(SESSION_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict) and ("default" in data or "chats" in data):
+                data.setdefault("default", {})
+                data.setdefault("chats", {})
+                return data
+            if isinstance(data, dict) and data:
+                return {"default": data, "chats": {}}
         except Exception as e:
             logger.error(f"Error reading session: {e}")
-    return {}
+    return {"default": {}, "chats": {}}
 
-def get_allen_token():
-    if RUNTIME_ALLEN_TOKEN:
+def _save_session_store(store):
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump(store, f)
+    except Exception as e:
+        logger.error(f"Error saving session: {e}")
+
+def save_allen_session(data, chat_id=None):
+    store = _load_session_store()
+    if chat_id is None:
+        store["default"] = data
+    else:
+        store["chats"][str(chat_id)] = data
+    _save_session_store(store)
+
+def get_allen_session(chat_id=None):
+    """Session for one channel/chat, falling back to the default session."""
+    store = _load_session_store()
+    if chat_id is not None:
+        sess = store["chats"].get(str(chat_id))
+        if sess:
+            return sess
+    return store.get("default") or {}
+
+def get_allen_token(chat_id=None):
+    if chat_id is None and RUNTIME_ALLEN_TOKEN:
         return RUNTIME_ALLEN_TOKEN
-    session = get_allen_session()
-    return session.get("access_token") or session.get("token") or ALLEN_ACCESS_TOKEN
+    session = get_allen_session(chat_id)
+    return session.get("access_token") or session.get("token") or (ALLEN_ACCESS_TOKEN if chat_id is None else "")
 
-def get_allen_device_id():
-    """Use one stable device identity for login and every authenticated request."""
-    session = get_allen_session()
+def get_allen_device_id(chat_id=None):
+    """One stable device identity per login session (per channel)."""
+    session = get_allen_session(chat_id)
     device_id = session.get("device_id") or os.getenv("ALLEN_DEVICE_ID", "").strip()
     if not device_id:
         # Stable across Heroku deploys without exposing the bot token itself.
-        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"allen-bot:{TG_BOT_TOKEN}"))
+        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"allen-bot:{TG_BOT_TOKEN}:{chat_id}"))
         session["device_id"] = device_id
-        save_allen_session(session)
+        if session:
+            save_allen_session(session, chat_id)
     return device_id
 
-def allen_headers(token):
+def allen_headers(token, chat_id=None):
     return {
         "Authorization": f"Bearer {token}",
-        "X-Device-Id": get_allen_device_id(),
+        "X-Device-Id": get_allen_device_id(chat_id),
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
         "Origin": "https://allen.in",
@@ -118,28 +144,28 @@ def allen_headers(token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
     }
 
-def allen_content_headers(token):
+def allen_content_headers(token, chat_id=None):
     """Match Allen web's content-request fingerprint exactly.
 
     X-Device-Id belongs to login/session requests. Sending it to pages/getPage
     can make that endpoint return HTTP 200 with an empty widgets list.
     """
-    headers = allen_headers(token).copy()
+    headers = allen_headers(token, chat_id).copy()
     headers.pop("X-Device-Id", None)
     # Allen's navigation renderer content-negotiates these headers. Removing
     # Accept/Accept-Language makes /library-web return a misleading 404 even
     # with a valid token, so preserve the browser fingerprint exactly.
     return headers
 
-def fetch_student_info(token):
+def fetch_student_info(token, chat_id=None):
     """Fetch student profile + enrolled courses/batches from Allen Digital."""
     r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                     headers=allen_content_headers(token), timeout=25)
+                     headers=allen_content_headers(token, chat_id), timeout=25)
     if r.status_code == 401:
         if ALLEN_USERNAME and ALLEN_PASSWORD:
-            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
+            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD, chat_id)
             r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                             headers=allen_content_headers(token), timeout=25)
+                             headers=allen_content_headers(token, chat_id), timeout=25)
         if r.status_code == 401:
             raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     data = r.json()
@@ -147,19 +173,20 @@ def fetch_student_info(token):
         raise ValueError(f"Allen error: {data.get('reason') or r.text[:150]}")
     return data["data"]
 
-def get_or_login_allen_token(force_login=False):
+def get_or_login_allen_token(force_login=False, chat_id=None):
     """Restore a configured token, or sign in automatically after a restart/expiry."""
-    token = None if force_login else get_allen_token()
+    token = None if force_login else get_allen_token(chat_id)
     if token:
         check = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
-                             headers=allen_content_headers(token), timeout=25)
+                             headers=allen_content_headers(token, chat_id), timeout=25)
         if check.status_code != 401:
             return token
-    if ALLEN_USERNAME and ALLEN_PASSWORD:
+    if chat_id is None and ALLEN_USERNAME and ALLEN_PASSWORD:
         return allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
     raise ValueError(
-        "Allen session saved nahi hai. Permanent login ke liye Heroku Config Vars me "
-        "ALLEN_USERNAME aur ALLEN_PASSWORD set karo, phir redeploy karo.")
+        "Is channel ka Allen session saved nahi hai. Pehle "
+        "<code>/login username*password -c &lt;channel_id&gt;</code> karo, "
+        "ya default login ke liye Heroku Config Vars me ALLEN_USERNAME/ALLEN_PASSWORD set karo.")
 
 app = Client(
     "allen_downloader_bot",
@@ -200,7 +227,7 @@ def _host_resolves(url):
         return False
 
 
-def allen_login_idpass(username, password):
+def allen_login_idpass(username, password, chat_id=None):
     """Authenticate via ALLEN Digital API (api.allen-live.in).
 
     Endpoint: POST /api/v1/auth/username
@@ -212,7 +239,7 @@ def allen_login_idpass(username, password):
     if not username or not password:
         raise ValueError("Username and password cannot be empty")
 
-    device_id = get_allen_device_id()
+    device_id = get_allen_device_id(chat_id)
     url = "https://api.allen-live.in/api/v1/auth/username"
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
@@ -245,13 +272,14 @@ def allen_login_idpass(username, password):
     if res.status_code == 200 and token:
         global ALLEN_BASE_URL, RUNTIME_ALLEN_TOKEN
         ALLEN_BASE_URL = "https://api.allen-live.in/api/v1"
-        RUNTIME_ALLEN_TOKEN = token
+        if chat_id is None:
+            RUNTIME_ALLEN_TOKEN = token
         session = {"access_token": token, "token": token,
                    "refresh_token": refresh,
                    "device_id": device_id,
                    "username": username, "host": "api.allen-live.in",
                    "login_at": int(time.time())}
-        save_allen_session(session)
+        save_allen_session(session, chat_id)
         return token
     reason = data.get("reason") or data.get("message") or res.text[:200]
     raise ValueError(f"Login failed (HTTP {res.status_code}): {reason}")
@@ -408,14 +436,14 @@ def build_caption(item, file_path, duration=0):
     return html.escape(caption)
 
 
-def allen_get_page(page_url, token):
+def allen_get_page(page_url, token, chat_id=None):
     r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
-                      headers=allen_content_headers(token), timeout=30)
+                      headers=allen_content_headers(token, chat_id), timeout=30)
     if r.status_code == 401:
         if ALLEN_USERNAME and ALLEN_PASSWORD:
-            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD)
+            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD, chat_id)
             r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
-                              headers=allen_content_headers(token), timeout=30)
+                              headers=allen_content_headers(token, chat_id), timeout=30)
         if r.status_code == 401:
             raise ValueError("Allen session expire hai aur automatic login configure nahi hai.")
     try:
@@ -526,7 +554,7 @@ def _allen_internal_urls(node, wanted_uri=None, with_labels=False):
     return list(dict.fromkeys(found))
 
 
-def _discover_subject_urls(token):
+def _discover_subject_urls(token, chat_id=None):
     """Ask Allen's own library pages for authoritative course/subject URLs."""
     discovered, queue, visited = [], ["/library-web", "/explore"], set()
     while queue and len(visited) < 8:
@@ -535,7 +563,7 @@ def _discover_subject_urls(token):
             continue
         visited.add(page_url)
         try:
-            page = allen_get_page(page_url, token)
+            page = allen_get_page(page_url, token, chat_id)
         except Exception as exc:
             logger.warning("Allen navigation discovery skipped %s: %s", page_url, exc)
             continue
@@ -593,11 +621,11 @@ def _taxonomy_candidates(info, course):
     return list(dict.fromkeys(v for v in found if v))
 
 
-def fetch_batch_contents(batch_id=None, token=None, subject=None):
+def fetch_batch_contents(batch_id=None, token=None, subject=None, chat_id=None):
     """All downloadable items of one batch, or of ALL purchased batches when batch_id is None/'all'."""
     if not token:
         raise ValueError("No token. /login ya /token pehle karo.")
-    info = fetch_student_info(token)
+    info = fetch_student_info(token, chat_id)
     student = info.get("student_detail") or {}
     student_stream = student.get("stream") or ""
     courses = info.get("course_details") or []
@@ -617,7 +645,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
     # The renderer can return account-specific batch subsets that are not present
     # as a simple enrolled/unenrolled combination. Prefer those server-generated
     # URLs and keep constructed URLs only as compatibility fallbacks.
-    discovered_subject_urls = _discover_subject_urls(token)
+    discovered_subject_urls = _discover_subject_urls(token, chat_id)
     logger.info("Allen navigation discovery found %s subject URL(s)", len(discovered_subject_urls))
 
     def _add(prefix, found, batch_name, subject, topic):
@@ -681,7 +709,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                                _query_value(url, "selected_batch_list")).split(",")]
             for page_url in exact_urls:
                 try:
-                    page = allen_get_page(page_url, token)
+                    page = allen_get_page(page_url, token, chat_id)
                     trial_contents, trial_chapters = [], []
                     _walk_page(page, trial_contents, trial_chapters)
                     if trial_contents or trial_chapters:
@@ -698,7 +726,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                             try:
                                 page = allen_get_page("/subject-details?" + _course_params(
                                     batch_ids, selected_list, cid, stream, sid,
-                                    taxonomy_id=taxonomy_id), token)
+                                    taxonomy_id=taxonomy_id), token, chat_id)
                                 trial_contents, trial_chapters = [], []
                                 _walk_page(page, trial_contents, trial_chapters)
                                 if trial_contents or trial_chapters:
@@ -728,7 +756,7 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None):
                     batch_ids, selected_list, cid, stream,
                     ch.get("subject_id") or sid, ch["topic_id"], taxonomy_id))
                 try:
-                    tpage = allen_get_page(topic_page_url, token)
+                    tpage = allen_get_page(topic_page_url, token, chat_id)
                 except Exception as e:
                     logger.warning(f"topic {ch.get('topic_name')} skipped: {e}")
                     continue
@@ -1071,10 +1099,19 @@ async def handle_login(client: Client, message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or "*" not in args[1]:
-        await message.reply_text("<blockquote><i>⚠️ Format incorrect!\nUsage: <code>/login username*password</code></i></blockquote>")
+        await message.reply_text("<blockquote><i>⚠️ Format incorrect!\nUsage: <code>/login username*password</code>\nKisi channel ke liye: <code>/login username*password -c &lt;channel_id&gt;</code></i></blockquote>")
         return
 
-    username, password = (part.strip() for part in args[1].strip().split("*", 1))
+    creds = args[1].strip()
+    session_chat_id = message.chat.id
+    if " -c " in creds:
+        creds, _, chan = creds.rpartition(" -c ")
+        try:
+            session_chat_id = int(chan.strip())
+        except Exception:
+            await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+            return
+    username, password = (part.strip() for part in creds.split("*", 1))
     if not username or not password:
         await message.reply_text("<blockquote><i>⚠️ Username and password cannot be empty.</i></blockquote>")
         return
@@ -1085,7 +1122,7 @@ async def handle_login(client: Client, message: Message):
     status_msg = await message.reply_text("<blockquote><i>🔑 Authenticating directly with Allen Servers...</i></blockquote>")
 
     try:
-        token = await asyncio.to_thread(allen_login_idpass, username, password)
+        token = await asyncio.to_thread(allen_login_idpass, username, password, session_chat_id)
         try:
             purged = await purge_uploaded_messages(app)
             logger.info(f"Auto-delete on new login: {purged} message(s) removed")
@@ -1094,7 +1131,7 @@ async def handle_login(client: Client, message: Message):
             purged = 0
         purged_note = f"\n🗑️ Purane {purged} uploads channel se delete ho gaye." if purged else ""
         await status_msg.edit_text(f"<blockquote><i>🔎 Login successful. Ab actual lectures verify ho rahe hain...{purged_note}</i></blockquote>")
-        sample = await asyncio.to_thread(fetch_batch_contents, None, token, "Physics")
+        sample = await asyncio.to_thread(fetch_batch_contents, None, token, "Physics", session_chat_id)
         if not sample:
             await status_msg.edit_text(
                 "<blockquote><i>⚠️ <b>Login valid hai, lekin Allen ne lecture page empty bheja.</b>\n"
@@ -1104,7 +1141,7 @@ async def handle_login(client: Client, message: Message):
             return
         await status_msg.edit_text(
             f"<blockquote><i>🎉 <b>Login + Lecture Test Successful!</b>\n\n"
-            f"✅ {len(sample)} Physics items mile. Session saved hai.\n"
+            f"✅ {len(sample)} Physics items mile. Session saved hai ({'channel ' + str(session_chat_id) if session_chat_id != message.chat.id else 'default'}).\n"
             "Ab <code>/mybatches</code> ya <code>/batch &lt;ID&gt; physics</code> chalao.</i></blockquote>")
         _schedule_delete(status_msg.chat.id, status_msg.id)
     except Exception as e:
@@ -1127,10 +1164,19 @@ async def handle_token(client: Client, message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/token &lt;ALLEN_JWT_TOKEN&gt;</code></i></blockquote>")
+        await message.reply_text("<blockquote><i>⚠️ Usage: <code>/token &lt;ALLEN_JWT_TOKEN&gt;</code> ya <code>/token &lt;TOKEN&gt; -c &lt;channel_id&gt;</code></i></blockquote>")
         return
 
     token = args[1].strip()
+    session_chat_id = message.chat.id
+    if " -c " in token:
+        token, _, chan = token.rpartition(" -c ")
+        token = token.strip()
+        try:
+            session_chat_id = int(chan.strip())
+        except Exception:
+            await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+            return
     try:
         await message.delete()  # token wali message turant hatao
     except Exception as e:
@@ -1154,9 +1200,9 @@ async def handle_token(client: Client, message: Message):
             return
 
         session = {"access_token": token, "token": token, "username": "token-login",
-                   "refresh_token": "", "device_id": get_allen_device_id(),
+                   "refresh_token": "", "device_id": get_allen_device_id(session_chat_id),
                    "host": "api.allen-live.in"}
-        save_allen_session(session)
+        save_allen_session(session, session_chat_id)
         ok_msg = await message.reply_text("<blockquote><i>🎉 <b>Token Saved! Session Active.</b>\n\nNow run: <code>/mybatches</code> to see your batches</i></blockquote>")
         _schedule_delete(ok_msg.chat.id, ok_msg.id)
     except Exception as e:
@@ -1173,8 +1219,8 @@ async def handle_mybatches(client: Client, message: Message):
 
     status_msg = await message.reply_text("<blockquote><i>🔄 <b>Fetching your purchased batches...</b></i></blockquote>")
     try:
-        token = await asyncio.to_thread(get_or_login_allen_token)
-        info = await asyncio.to_thread(fetch_student_info, token)
+        token = await asyncio.to_thread(get_or_login_allen_token, False, message.chat.id)
+        info = await asyncio.to_thread(fetch_student_info, token, message.chat.id)
         student = info.get("student_detail") or {}
         courses = info.get("course_details") or []
         if not courses:
@@ -1202,6 +1248,38 @@ def _job_key(chat_id, batch_id, subject):
     return f"{chat_id}|{batch_id or 'ALL'}|{subject or 'ALL'}"
 
 
+# ==========================================
+# CUSTOM THUMBNAILS (PER CHANNEL)
+# ==========================================
+THUMB_FILE = "channel_thumbs.json"
+PENDING_THUMB = {}  # chat_id -> {"event": asyncio.Event, "file_id": str|None, "user_id": int}
+
+def _load_thumbs():
+    if os.path.exists(THUMB_FILE):
+        try:
+            with open(THUMB_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def get_channel_thumb(chat_id):
+    """Telegram file_id of the custom thumbnail set for this channel (or None)."""
+    return _load_thumbs().get(str(chat_id))
+
+def set_channel_thumb(chat_id, file_id):
+    data = _load_thumbs()
+    if file_id:
+        data[str(chat_id)] = file_id
+    else:
+        data.pop(str(chat_id), None)
+    try:
+        with open(THUMB_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Error saving thumbnails: {e}")
+
+
 async def run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg):
     """Pipeline: parallel downloads feeding a single uploader -> max speed per job.
     Multiple jobs (different batches / channels) can run at the same time."""
@@ -1216,8 +1294,17 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     ok = failed = 0
     failed_titles = []
 
+    custom_thumb_path = None
+    thumb_fid = get_channel_thumb(target_chat_id)
+    if thumb_fid:
+        try:
+            custom_thumb_path = await app.download_media(thumb_fid, file_name=os.path.join(work_dir, "custom_thumb.jpg"))
+        except Exception as e:
+            logger.warning(f"Custom thumbnail download failed: {e}")
+            custom_thumb_path = None
+
     try:
-        items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject)
+        items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject, target_chat_id)
         pending = [i for i in items if i["id"] not in done]
         if not items:
             await status_msg.edit_text(
@@ -1323,6 +1410,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     if path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         video_path, thumb_path = await asyncio.to_thread(prepare_video_for_upload, path)
                         upload_path = video_path
+                        if custom_thumb_path and os.path.exists(custom_thumb_path):
+                            thumb_path = None  # generated thumb discard; custom use hoga
                     dur = w = h = 0
                     if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         dur, w, h = await asyncio.to_thread(probe_video, upload_path)
@@ -1333,7 +1422,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                                 video_path = reduced
                                 dur, w, h = await asyncio.to_thread(probe_video, upload_path)
                     caption = build_caption(item, upload_path, dur)
-                    await async_upload_to_telegram(app, target_chat_id, upload_path, caption, thumb_path, dur, w, h)
+                    await async_upload_to_telegram(app, target_chat_id, upload_path, caption,
+                                                   custom_thumb_path or thumb_path, dur, w, h)
                     mark_done(item["id"], done)
                     ok += 1
                 except Exception as e:
@@ -1436,12 +1526,6 @@ async def handle_batch(client: Client, message: Message):
         await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
         return
 
-    try:
-        token = await asyncio.to_thread(get_or_login_allen_token)
-    except Exception as e:
-        await message.reply_text(f"<blockquote><i>❌ <b>Session Error:</b> <code>{str(e)}</code></i></blockquote>")
-        return
-
     # /batch <BATCH_ID> [subject] [-c <channel_id>]     (BATCH_ID optional = all batches)
     parts = (message.text or "").split()[1:]
     target_chat_id = message.chat.id
@@ -1453,6 +1537,12 @@ async def handle_batch(client: Client, message: Message):
             await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
             return
         parts = parts[:i] + parts[i + 2:]
+
+    try:
+        token = await asyncio.to_thread(get_or_login_allen_token, False, target_chat_id)
+    except Exception as e:
+        await message.reply_text(f"<blockquote><i>❌ <b>Session Error:</b> <code>{str(e)}</code></i></blockquote>")
+        return
 
     batch_id, subject_raw = None, None
     for token_arg in parts:
@@ -1478,6 +1568,28 @@ async def handle_batch(client: Client, message: Message):
 
     scope = f"{batch_id or 'ALL batches'} | {subject or 'All subjects'}"
     dest = "yahin" if target_chat_id == message.chat.id else f"<code>{target_chat_id}</code>"
+
+    # Custom thumbnail: agar is channel ke liye set nahi hai toh pehle poochho.
+    if not get_channel_thumb(target_chat_id):
+        pend = {"event": asyncio.Event(), "file_id": None,
+                "user_id": message.from_user.id if message.from_user else None}
+        PENDING_THUMB[message.chat.id] = pend
+        ask_msg = await message.reply_text(
+            "<blockquote><i>🖼 <b>Custom thumbnail bhejo</b> (ek photo) — ye is channel ke saare videos par lagega.\n"
+            "Auto thumbnail chahiye toh <code>/skip</code> bhejo. (90 sec wait)</i></blockquote>")
+        try:
+            await asyncio.wait_for(pend["event"].wait(), timeout=90)
+        except asyncio.TimeoutError:
+            pass
+        PENDING_THUMB.pop(message.chat.id, None)
+        try:
+            await ask_msg.delete()
+        except Exception:
+            pass
+        if pend["file_id"]:
+            set_channel_thumb(target_chat_id, pend["file_id"])
+            await message.reply_text("<blockquote><i>✅ Custom thumbnail set ho gaya.</i></blockquote>")
+
     status_msg = await message.reply_text(
         f"<blockquote><i>🔄 <b>Fetching:</b> {scope}\nUpload → {dest}</i></blockquote>")
 
@@ -1586,6 +1698,62 @@ async def handle_stop(client: Client, message: Message):
         await message.reply_text(f"<blockquote><i>🛑 {stopped} job(s) rok diye.</i></blockquote>")
     else:
         await message.reply_text("<blockquote><i>⚠️ Koi active task nahi hai.</i></blockquote>")
+
+
+@app.on_message(filters.command("setthumb") & (filters.group | filters.channel | filters.private))
+async def handle_setthumb(client: Client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        return
+    target_chat_id = message.chat.id
+    parts = (message.text or "").split()[1:]
+    if "-c" in parts:
+        i = parts.index("-c")
+        try:
+            target_chat_id = int(parts[i + 1])
+        except Exception:
+            await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+            return
+    photo = message.photo or (message.reply_to_message.photo if message.reply_to_message else None)
+    if not photo:
+        await message.reply_text("<blockquote><i>⚠️ Ek photo ke saath <code>/setthumb</code> bhejo (caption me) ya kisi photo ko reply karke <code>/setthumb</code> likho.\nChannel ke liye: <code>/setthumb -c &lt;channel_id&gt;</code></i></blockquote>")
+        return
+    set_channel_thumb(target_chat_id, photo.file_id)
+    await message.reply_text(f"<blockquote><i>✅ Custom thumbnail set ho gaya ({'channel ' + str(target_chat_id) if target_chat_id != message.chat.id else 'is chat'} ke liye).</i></blockquote>")
+
+
+@app.on_message(filters.command("delthumb") & (filters.group | filters.channel | filters.private))
+async def handle_delthumb(client: Client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        return
+    target_chat_id = message.chat.id
+    parts = (message.text or "").split()[1:]
+    if "-c" in parts:
+        i = parts.index("-c")
+        try:
+            target_chat_id = int(parts[i + 1])
+        except Exception:
+            return
+    set_channel_thumb(target_chat_id, None)
+    await message.reply_text("<blockquote><i>🗑 Custom thumbnail hata diya. Ab auto thumbnail lagega.</i></blockquote>")
+
+
+@app.on_message(filters.command("skip") & (filters.group | filters.channel | filters.private))
+async def handle_skip(client: Client, message: Message):
+    pend = PENDING_THUMB.get(message.chat.id)
+    if pend:
+        pend["file_id"] = None
+        pend["event"].set()
+
+
+@app.on_message(filters.photo & (filters.group | filters.channel | filters.private))
+async def handle_photo(client: Client, message: Message):
+    pend = PENDING_THUMB.get(message.chat.id)
+    if not pend or pend["event"].is_set():
+        return
+    if pend["user_id"] and message.from_user and message.from_user.id != pend["user_id"]:
+        return
+    pend["file_id"] = message.photo.file_id
+    pend["event"].set()
 
 
 @app.on_message(filters.command("id"))
