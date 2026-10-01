@@ -1358,11 +1358,40 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     if not running():
                         slots.release()
                         return
+                    # Lecture links expire after a few hours -> fetch fresh link and retry once.
+                    try:
+                        fresh = await refresh_url(item)
+                        if fresh and fresh != url:
+                            item["url"] = fresh
+                            if ".m3u8" in fresh:
+                                path = await async_download_m3u8(fresh, clean, token, work_dir)
+                            else:
+                                ext = os.path.splitext(fresh.split("?")[0])[1] or ".pdf"
+                                path = await asyncio.to_thread(download_file, fresh, os.path.join(work_dir, clean + ext))
+                    except Exception as e2:
+                        e = e2
+                if path is None and running():
                     failed += 1
                     logger.error(f"Download failed ({title}): {e}")
                     failed_titles.append(f"{title} (download)")
                 # Even failures have an index, so the uploader can advance in order.
                 await queue.put((idx, item, title, path))
+
+        fresh_cache = {"at": 0, "map": {}}
+        refresh_lock = asyncio.Lock()
+
+        async def refresh_url(item):
+            async with refresh_lock:
+                if time.time() - fresh_cache["at"] > 600:
+                    try:
+                        new_items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject, target_chat_id)
+                        fresh_cache["map"] = {i["id"]: i.get("url") for i in new_items}
+                        fresh_cache["at"] = time.time()
+                        logger.info(f"Refreshed {len(new_items)} lecture links")
+                    except Exception as re_:
+                        logger.warning(f"Link refresh failed: {re_}")
+                        fresh_cache["at"] = time.time()
+                return fresh_cache["map"].get(item["id"])
 
         def item_group(item):
             subj = str(item.get("subject") or "").strip()
@@ -1455,6 +1484,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         continue
                     idx, item, title, path = ready.pop(next_index)
                     next_index += 1
+                    if path is None:
+                        slots.release()
+                        continue  # failed lecture: no empty heading
                     group = item_group(item)
                     if group not in announced_sections:
                         # Finish the old section before pinning the next heading.
