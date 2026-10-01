@@ -1485,7 +1485,7 @@ def set_channel_thumb(chat_id, file_id):
 SUBJECT_ORDER = {"physics": 0, "chemistry": 1, "maths": 2, "mathematics": 2, "math": 2, "biology": 3}
 
 
-def pe(name, fallback):
+def premium_emoji(name, fallback):
     """Premium (custom) emoji: set Heroku Config Var EMOJI_<NAME>=<custom_emoji_id>.
     Not set -> normal emoji."""
     eid = os.getenv(f"EMOJI_{name.upper()}", "").strip()
@@ -1497,7 +1497,7 @@ def _kind_label(kind):
 
 
 def _kind_emoji(kind):
-    return pe("live", "🔴") if "live" in str(kind or "").lower() else pe("recorded", "🎬")
+    return premium_emoji("live", "🔴") if "live" in str(kind or "").lower() else premium_emoji("recorded", "🎬")
 
 
 def sort_for_index(items):
@@ -1590,6 +1590,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 clean = f"{idx}_{clean}"
                 url = item.get("url")
                 path = None
+                err = None
                 try:
                     if not url:
                         raise ValueError("Lecture URL missing")
@@ -1599,6 +1600,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
                         path = await asyncio.to_thread(download_file, url, os.path.join(work_dir, clean + ext))
                 except Exception as e:
+                    err = e
+                if path is None and err is not None:
                     if not running():
                         slots.release()
                         return
@@ -1613,10 +1616,10 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                                 ext = os.path.splitext(fresh.split("?")[0])[1] or ".pdf"
                                 path = await asyncio.to_thread(download_file, fresh, os.path.join(work_dir, clean + ext))
                     except Exception as e2:
-                        e = e2
+                        err = e2
                 if path is None and running():
                     failed += 1
-                    logger.error(f"Download failed ({title}): {e}")
+                    logger.error(f"Download failed ({title}): {err}")
                     failed_titles.append(f"{title} (download)")
                 # Even failures have an index, so the uploader can advance in order.
                 await queue.put((idx, item, title, path))
@@ -1656,7 +1659,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 try:
                     bm = await app.send_message(
                         target_chat_id,
-                        f"{pe('subject', '📘')} <b>{html.escape(subj.upper() or 'SUBJECT')}</b>\n"
+                        f"{premium_emoji('subject', '📘')} <b>{html.escape(subj.upper() or 'SUBJECT')}</b>\n"
                         f"{_kind_emoji(kind)} <b>{html.escape(kind.upper())}</b>\n"
                         f"<i>{html.escape(batch_name)}</i>")
                     log_uploaded_message(target_chat_id, getattr(bm, "id", None))
@@ -1668,8 +1671,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     logger.warning(f"Block header failed: {be}")
             heading = (f"<b>{html.escape(batch_name)}</b>\n"
                        f"{_kind_emoji(kind)} <b>{html.escape(kind)}</b>\n"
-                       f"{pe('chapter', '📚')} <b>{html.escape(subj)} - {html.escape(chapter)}</b>\n\n"
-                       f"{pe('section', '🔷')} <b>{html.escape(section)}</b>")
+                       f"{premium_emoji('chapter', '📚')} <b>{html.escape(subj)} - {html.escape(chapter)}</b>\n\n"
+                       f"{premium_emoji('section', '🔷')} <b>{html.escape(section)}</b>")
             try:
                 cm = await app.send_message(target_chat_id, heading)
                 log_uploaded_message(target_chat_id, getattr(cm, "id", None))
@@ -1677,8 +1680,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 section_index.append((subj, kind, chapter, section, getattr(cm, "link", None)))
                 try:
                     await cm.pin(disable_notification=True)
-                except Exception as pe:
-                    logger.warning(f"Section pin failed: {pe}")
+                except Exception as pin_err:
+                    logger.warning(f"Section pin failed: {pin_err}")
             except Exception as ce:
                 announced_sections[group] = None
                 section_index.append((subj, kind, chapter, section, None))
@@ -1756,7 +1759,10 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         if in_flight:
                             await asyncio.gather(*in_flight, return_exceptions=True)
                             in_flight.clear()
-                        await announce_group(item)
+                        try:
+                            await announce_group(item)
+                        except Exception as ae:
+                            logger.warning(f"Heading failed: {ae}")
                     in_flight.add(asyncio.create_task(upload_one(idx, item, title, path)))
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
@@ -1764,11 +1770,22 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         downloaders = [asyncio.create_task(downloader()) for _ in range(MAX_PARALLEL_DOWNLOADS)]
         up = asyncio.create_task(uploader())
         ACTIVE_JOBS[key]["tasks"] = downloaders + [up]
+
+        def _up_done(t):
+            # Uploader crash ho jaye to downloaders hamesha ke liye atke na rahein.
+            if t.cancelled() or t.exception() is not None:
+                if not t.cancelled():
+                    logger.error(f"Uploader crashed: {t.exception()}")
+                for d in downloaders:
+                    d.cancel()
+        up.add_done_callback(_up_done)
         await asyncio.gather(*downloaders, return_exceptions=True)
         try:
             await up
         except asyncio.CancelledError:
             pass
+        except Exception as ue:
+            await message.reply_text(f"<blockquote><i>❌ Upload error: <code>{html.escape(str(ue))}</code></i></blockquote>")
 
         stopped = not running()
         if section_index:
@@ -1784,11 +1801,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 for chapter, section, link in blocks[(subj, kind)]:
                     if chapter != last_ch:
                         ch_no += 1
-                        rows.append(f"\n<b>{ch_no}. {pe('chapter', '📚')} {html.escape(chapter)}</b>")
+                        rows.append(f"\n<b>{ch_no}. {premium_emoji('chapter', '📚')} {html.escape(chapter)}</b>")
                         last_ch = chapter
-                    label = pe("section", "🔷") + " " + html.escape(section)
+                    label = premium_emoji("section", "🔷") + " " + html.escape(section)
                     rows.append(f'   <a href="{link}">{label}</a>' if link else f"   {label}")
-                head = (f"{pe('index', '📑')} <b>{html.escape(subj)} — {_kind_emoji(kind)} {html.escape(kind)} Index</b>"
+                head = (f"{premium_emoji('index', '📑')} <b>{html.escape(subj)} — {_kind_emoji(kind)} {html.escape(kind)} Index</b>"
                         + (" (stopped)" if stopped else ""))
                 chunk = head
                 for row in rows:
