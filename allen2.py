@@ -347,6 +347,101 @@ def mark_done(content_id, done_set):
         logger.warning(f"Could not persist progress: {e}")
 
 
+# ---- Progress state: channel ke andar hi save (Heroku restart ke baad bhi resume) ----
+STATE_MSG_FILE = "state_msgs.json"
+STATE_TAG = "#allen_state"
+
+
+def _load_state_msgs():
+    if os.path.exists(STATE_MSG_FILE):
+        try:
+            with open(STATE_MSG_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items() if v}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_state_msg_id(chat_id, msg_id):
+    try:
+        data = _load_state_msgs()
+        data[str(chat_id)] = int(msg_id)
+        with open(STATE_MSG_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"State msg id save failed: {e}")
+
+
+async def load_state_from_channel(client, chat_id):
+    """Channel me padi #allen_state file se pehle-uploaded IDs wapas lao."""
+    msg = None
+    msg_id = _load_state_msgs().get(str(chat_id))
+    if msg_id:
+        try:
+            m = await client.get_messages(int(chat_id), msg_id)
+            if m and m.document:
+                msg = m
+        except Exception:
+            msg = None
+    if msg is None:
+        try:
+            async for m in client.search_messages(int(chat_id), query=STATE_TAG, limit=5):
+                if m.document:
+                    msg = m
+                    _save_state_msg_id(chat_id, m.id)
+                    break
+        except Exception as e:
+            logger.warning(f"State search failed: {e}")
+    if msg is None:
+        return set()
+    try:
+        path = await client.download_media(msg, file_name="state_dl.json")
+        with open(path, "r") as f:
+            data = json.load(f)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if isinstance(data, list):
+            logger.info(f"Remote progress loaded: {len(data)} items already done")
+            return set(data)
+    except Exception as e:
+        logger.warning(f"State load failed: {e}")
+    return set()
+
+
+async def save_state_to_channel(client, chat_id, done_set):
+    """Uploaded IDs ki list channel me #allen_state file ke roop me save/update karo."""
+    tmp = os.path.join(DOWNLOAD_DIR, "allen_state.json")
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(sorted(done_set), f)
+        msg_id = _load_state_msgs().get(str(chat_id))
+        edited = False
+        if msg_id:
+            try:
+                from pyrogram.types import InputMediaDocument
+                await client.edit_message_media(int(chat_id), int(msg_id),
+                                                InputMediaDocument(tmp, caption=STATE_TAG))
+                edited = True
+            except Exception as e:
+                logger.warning(f"State edit failed (naya bhejunga): {e}")
+        if not edited:
+            m = await client.send_document(int(chat_id), tmp, caption=STATE_TAG,
+                                           disable_notification=True)
+            _save_state_msg_id(chat_id, m.id)
+    except Exception as e:
+        logger.warning(f"State save failed: {e}")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 # ---- Uploaded-message tracking + auto-delete on new login ----
 UPLOAD_LOG_FILE = "uploaded_messages.json"
 
@@ -396,7 +491,12 @@ async def purge_uploaded_messages(client):
                 total += len(chunk)
             except Exception as e:
                 logger.warning(f"Could not delete uploads in chat {chat_id}: {e}")
-    for stale in (UPLOAD_LOG_FILE, DONE_FILE):
+    for chat_id, msg_id in _load_state_msgs().items():
+        try:
+            await client.delete_messages(int(chat_id), int(msg_id), revoke=True)
+        except Exception:
+            pass
+    for stale in (UPLOAD_LOG_FILE, DONE_FILE, STATE_MSG_FILE):
         try:
             os.remove(stale)
         except OSError:
@@ -1291,6 +1391,12 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     announced_sections = {}
     os.makedirs(work_dir, exist_ok=True)
     done = load_done()
+    try:
+        remote_done = await load_state_from_channel(app, target_chat_id)
+        if remote_done:
+            done |= remote_done
+    except Exception as e:
+        logger.warning(f"Remote progress load failed: {e}")
     ok = failed = 0
     failed_titles = []
 
@@ -1455,6 +1561,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                                                    custom_thumb_path or thumb_path, dur, w, h)
                     mark_done(item["id"], done)
                     ok += 1
+                    if ok % 25 == 0:
+                        asyncio.create_task(save_state_to_channel(app, target_chat_id, done))
                 except Exception as e:
                     failed += 1
                     logger.error(f"Upload failed ({title}): {e}")
@@ -1535,6 +1643,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 f"<blockquote><i>🛑 Stopped. Uploaded: {ok} | Failed: {failed}</i></blockquote>")
             return
 
+        await save_state_to_channel(app, target_chat_id, done)
         if failed_titles:
             txt = "⚠️ Failed list:\n" + "\n".join(failed_titles[:40])
             if len(failed_titles) > 40:
