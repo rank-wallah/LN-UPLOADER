@@ -412,6 +412,42 @@ async def load_state_from_channel(client, chat_id):
     return set()
 
 
+def _title_key(title):
+    """Caption/title ko normalize karo taaki channel scan se match ho sake."""
+    t = str(title or "")
+    m = re.match(r"^\[[^\]]+\]\s*", t)
+    if m:
+        t = t[m.end():]
+    t = re.sub(r'[\\/:*?"<>|]+', " - ", t)
+    t = os.path.splitext(t)[0]
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+async def scan_channel_uploads(client, chat_id):
+    """Channel ke saare video messages ke captions padh kar already-uploaded
+    lecture titles ka set lao — state file na mile toh bhi resume ho."""
+    titles = set()
+    try:
+        count = 0
+        async for m in client.get_chat_history(int(chat_id)):
+            if not (m.video or m.document):
+                continue
+            cap = m.caption or ""
+            for line in cap.splitlines():
+                line = line.strip()
+                if line.lower().startswith("file title"):
+                    _, _, val = line.partition(":")
+                    key = _title_key(val)
+                    if key:
+                        titles.add(key)
+            count += 1
+        if count:
+            logger.info(f"Channel scan: {count} media messages, {len(titles)} lecture titles mile")
+    except Exception as e:
+        logger.warning(f"Channel scan failed: {e}")
+    return titles
+
+
 async def save_state_to_channel(client, chat_id, done_set):
     """Uploaded IDs ki list channel me #allen_state file ke roop me save/update karo."""
     tmp = os.path.join(DOWNLOAD_DIR, "allen_state.json")
@@ -1397,6 +1433,11 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             done |= remote_done
     except Exception as e:
         logger.warning(f"Remote progress load failed: {e}")
+    try:
+        chan_titles = await scan_channel_uploads(app, target_chat_id)
+    except Exception as e:
+        logger.warning(f"Channel scan failed: {e}")
+        chan_titles = set()
     ok = failed = 0
     failed_titles = []
 
@@ -1411,7 +1452,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
 
     try:
         items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject, target_chat_id)
-        pending = [i for i in items if i["id"] not in done]
+        pending = [i for i in items
+                   if i["id"] not in done and _title_key(i.get("title")) not in chan_titles]
         if not items:
             await status_msg.edit_text(
                 "<blockquote><i>❌ Allen library me is batch/subject ka lecture link nahi mila. "
