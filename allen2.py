@@ -578,12 +578,12 @@ def build_caption(item, file_path, duration=0):
     lines = [f"File Title : {file_title}"]
     lines += [f"Batch Name : {batch}", f"Topic Name : {topic_line}"]
     if item.get("kind"):
-        lines.append(f"Type : {item['kind']}")
+        lines.append("Type : \x01" + item["kind"] + "\x02")
     if item.get("date"):
         lines.append(f"Date : {item['date']}")
     lines.append("Extracted By ➤ Courier Well")
-    caption = "\n".join(lines)
-    return html.escape(caption)
+    caption = html.escape("\n".join(lines))
+    return caption.replace("\x01", "<b>").replace("\x02", "</b>")
 
 
 def allen_get_page(page_url, token, chat_id=None):
