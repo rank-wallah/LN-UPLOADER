@@ -1482,6 +1482,34 @@ def set_channel_thumb(chat_id, file_id):
         logger.error(f"Error saving thumbnails: {e}")
 
 
+SUBJECT_ORDER = {"physics": 0, "chemistry": 1, "maths": 2, "mathematics": 2, "math": 2, "biology": 3}
+
+
+def pe(name, fallback):
+    """Premium (custom) emoji: set Heroku Config Var EMOJI_<NAME>=<custom_emoji_id>.
+    Not set -> normal emoji."""
+    eid = os.getenv(f"EMOJI_{name.upper()}", "").strip()
+    return f'<emoji id="{eid}">{fallback}</emoji>' if eid.isdigit() else fallback
+
+
+def _kind_label(kind):
+    return "Live Lectures" if "live" in str(kind or "").lower() else "Recorded Lectures"
+
+
+def _kind_emoji(kind):
+    return pe("live", "🔴") if "live" in str(kind or "").lower() else pe("recorded", "🎬")
+
+
+def sort_for_index(items):
+    """Subject -> Live/Recorded -> original Allen order (chapters stay in sequence)."""
+    pos = {id(i): n for n, i in enumerate(items)}
+    def k(i):
+        subj = str(i.get("subject") or "").strip().lower()
+        live = 0 if "live" in str(i.get("kind") or "").lower() else 1
+        return (SUBJECT_ORDER.get(subj, 9), subj, live, pos[id(i)])
+    return sorted(items, key=k)
+
+
 async def run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg):
     """Pipeline: parallel downloads feeding a single uploader -> max speed per job.
     Multiple jobs (different batches / channels) can run at the same time."""
@@ -1489,7 +1517,8 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     work_dir = os.path.join(DOWNLOAD_DIR, str(abs(hash(key)) % 10**8))
     STOPPED_DIRS.discard(os.path.abspath(work_dir))
     ACTIVE_JOBS[key] = {"running": True, "chat": message.chat.id, "work_dir": work_dir, "tasks": []}
-    section_index = []  # (subject, chapter, section, message link)
+    section_index = []  # (subject, kind, chapter, section, message link)
+    announced_blocks = set()
     announced_sections = {}
     os.makedirs(work_dir, exist_ok=True)
     done = load_done(target_chat_id)
@@ -1525,6 +1554,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 "<blockquote><i>❌ Allen library me is batch/subject ka lecture link nahi mila. "
                 "Login/session valid hai—dobara login mat karein. ✅ Batch ID ko <code>/mybatches</code> se check karein.</i></blockquote>")
             return
+        pending = sort_for_index(pending)
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
             return
@@ -1612,29 +1642,46 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             topic = str(item.get("topic") or "").strip()
             chapter = topic or subj or "Chapter"
             section = str(item.get("section") or "Other Material").strip()
-            return subj, chapter, section
+            return subj, _kind_label(item.get("kind")), chapter, section
 
         async def announce_group(item):
             group = item_group(item)
             if group in announced_sections:
                 return
-            subj, chapter, section = group
+            subj, kind, chapter, section = group
             batch_name = str(item.get("batch") or "Allen Batch").strip()
+            block = (subj, kind)
+            if block not in announced_blocks:
+                announced_blocks.add(block)
+                try:
+                    bm = await app.send_message(
+                        target_chat_id,
+                        f"{pe('subject', '📘')} <b>{html.escape(subj.upper() or 'SUBJECT')}</b>\n"
+                        f"{_kind_emoji(kind)} <b>{html.escape(kind.upper())}</b>\n"
+                        f"<i>{html.escape(batch_name)}</i>")
+                    log_uploaded_message(target_chat_id, getattr(bm, "id", None))
+                    try:
+                        await bm.pin(disable_notification=True)
+                    except Exception as pe_:
+                        logger.warning(f"Block pin failed: {pe_}")
+                except Exception as be:
+                    logger.warning(f"Block header failed: {be}")
             heading = (f"<b>{html.escape(batch_name)}</b>\n"
-                       f"📚 <b>{html.escape(subj)} - {html.escape(chapter)}</b>\n\n"
-                       f"🔷 <b>{html.escape(section)}</b>")
+                       f"{_kind_emoji(kind)} <b>{html.escape(kind)}</b>\n"
+                       f"{pe('chapter', '📚')} <b>{html.escape(subj)} - {html.escape(chapter)}</b>\n\n"
+                       f"{pe('section', '🔷')} <b>{html.escape(section)}</b>")
             try:
                 cm = await app.send_message(target_chat_id, heading)
                 log_uploaded_message(target_chat_id, getattr(cm, "id", None))
                 announced_sections[group] = getattr(cm, "link", None)
-                section_index.append((subj, chapter, section, getattr(cm, "link", None)))
+                section_index.append((subj, kind, chapter, section, getattr(cm, "link", None)))
                 try:
                     await cm.pin(disable_notification=True)
                 except Exception as pe:
                     logger.warning(f"Section pin failed: {pe}")
             except Exception as ce:
                 announced_sections[group] = None
-                section_index.append((subj, chapter, section, None))
+                section_index.append((subj, kind, chapter, section, None))
                 logger.warning(f"Section header failed: {ce}")
 
         async def uploader():
@@ -1725,27 +1772,37 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
 
         stopped = not running()
         if section_index:
-            rows = []
-            last_index_chapter = None
-            chapter_no = 0
-            for subj, chapter, section, link in section_index:
-                chapter_key = (subj, chapter)
-                if chapter_key != last_index_chapter:
-                    chapter_no += 1
-                    rows.append(f"\n<b>{chapter_no}. 📚 {html.escape(subj)} - {html.escape(chapter)}</b>")
-                    last_index_chapter = chapter_key
-                label = "🔷 " + html.escape(section)
-                rows.append(f'   <a href="{link}">{label}</a>' if link else f"   {label}")
-            head = "<b>📚 Batch Index</b>" + (" (stopped)" if stopped else "")
-            chunk = head
-            for row in rows:
-                if len(chunk) + len(row) + 1 > 3900:
-                    im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
-                    log_uploaded_message(target_chat_id, getattr(im, "id", None))
-                    chunk = head + " (contd.)"
-                chunk += "\n" + row
-            im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
-            log_uploaded_message(target_chat_id, getattr(im, "id", None))
+            blocks = {}
+            for subj, kind, chapter, section, link in section_index:
+                blocks.setdefault((subj, kind), []).append((chapter, section, link))
+            order = sorted(blocks, key=lambda b: (SUBJECT_ORDER.get(b[0].lower(), 9), b[0].lower(),
+                                                  0 if "live" in b[1].lower() else 1))
+            for subj, kind in order:
+                rows = []
+                last_ch = None
+                ch_no = 0
+                for chapter, section, link in blocks[(subj, kind)]:
+                    if chapter != last_ch:
+                        ch_no += 1
+                        rows.append(f"\n<b>{ch_no}. {pe('chapter', '📚')} {html.escape(chapter)}</b>")
+                        last_ch = chapter
+                    label = pe("section", "🔷") + " " + html.escape(section)
+                    rows.append(f'   <a href="{link}">{label}</a>' if link else f"   {label}")
+                head = (f"{pe('index', '📑')} <b>{html.escape(subj)} — {_kind_emoji(kind)} {html.escape(kind)} Index</b>"
+                        + (" (stopped)" if stopped else ""))
+                chunk = head
+                for row in rows:
+                    if len(chunk) + len(row) + 1 > 3900:
+                        im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
+                        log_uploaded_message(target_chat_id, getattr(im, "id", None))
+                        chunk = head + " (contd.)"
+                    chunk += "\n" + row
+                im = await app.send_message(target_chat_id, chunk, disable_web_page_preview=True)
+                log_uploaded_message(target_chat_id, getattr(im, "id", None))
+                try:
+                    await im.pin(disable_notification=True)
+                except Exception:
+                    pass
         if stopped:
             await message.reply_text(
                 f"<blockquote><i>🛑 Stopped. Uploaded: {ok} | Failed: {failed}</i></blockquote>")
