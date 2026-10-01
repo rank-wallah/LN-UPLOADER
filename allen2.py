@@ -328,21 +328,30 @@ def normalize_subject(raw):
 DONE_FILE = "uploaded_contents.json"
 
 
-def load_done():
+def _load_done_all():
     if os.path.exists(DONE_FILE):
         try:
             with open(DONE_FILE, "r") as f:
-                return set(json.load(f))
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): set(v) for k, v in data.items() if isinstance(v, list)}
         except Exception:
             pass
-    return set()
+    return {}  # purana flat format: kis channel ka tha pata nahi, isliye ignore
 
 
-def mark_done(content_id, done_set):
+def load_done(chat_id):
+    """Sirf ISI channel ke uploaded IDs — dusre channel ka record mix nahi hota."""
+    return set(_load_done_all().get(str(chat_id), set()))
+
+
+def mark_done(content_id, done_set, chat_id):
     done_set.add(content_id)
     try:
+        data = _load_done_all()
+        data[str(chat_id)] = set(data.get(str(chat_id), set())) | done_set
         with open(DONE_FILE, "w") as f:
-            json.dump(list(done_set), f)
+            json.dump({k: sorted(v) for k, v in data.items()}, f)
     except Exception as e:
         logger.warning(f"Could not persist progress: {e}")
 
@@ -567,7 +576,12 @@ def build_caption(item, file_path, duration=0):
         topic_line = subject or topic or "Topic"
 
     lines = [f"File Title : {file_title}"]
-    lines += [f"Batch Name : {batch}", f"Topic Name : {topic_line}", "Extracted By ➤ Courier Well"]
+    lines += [f"Batch Name : {batch}", f"Topic Name : {topic_line}"]
+    if item.get("kind"):
+        lines.append(f"Type : {item['kind']}")
+    if item.get("date"):
+        lines.append(f"Date : {item['date']}")
+    lines.append("Extracted By ➤ Courier Well")
     caption = "\n".join(lines)
     return html.escape(caption)
 
@@ -616,6 +630,55 @@ def _content_section(action):
     return "Other Material"
 
 
+_DATE_KEYS = ("start_time", "startTime", "start_date", "scheduled_at", "scheduled_time",
+              "class_date", "date", "published_at", "created_at", "live_at")
+
+
+def _fmt_date(v):
+    try:
+        if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+            n = float(v)
+            if n > 1e12:
+                n /= 1000
+            if n < 1e9:
+                return ""
+            import datetime as _dt
+            return (_dt.datetime.utcfromtimestamp(n) + _dt.timedelta(hours=5, minutes=30)).strftime("%d-%m-%Y")
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(v))
+        if m:
+            return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        m = re.search(r"\b(\d{1,2})[-/ ](\d{1,2}|[A-Za-z]{3,9})[-/ ,]+(\d{2,4})\b", str(v))
+        if m:
+            return m.group(0).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _lecture_meta(node, action, d):
+    """Lecture type (Live / Recorded) aur date nikalo."""
+    current = ((action.get("tracking_params") or {}).get("current") or {})
+    blob = " ".join(str(x) for x in (current.get("card_type"), current.get("content_type"),
+                                     d.get("content_type"), d.get("type"), node.get("tag"),
+                                     node.get("badge"), node.get("subtitle")) if x).lower()
+    if "live" in blob and "concept" not in blob:
+        kind = "Live Lecture"
+    else:
+        kind = "Recorded Lecture"
+    date = ""
+    for src in (d, node, current, action.get("data") or {}):
+        for k in _DATE_KEYS:
+            if isinstance(src, dict) and src.get(k):
+                date = _fmt_date(src.get(k))
+                if date:
+                    break
+        if date:
+            break
+    if not date:
+        date = _fmt_date(node.get("subtitle") or "") or _fmt_date(node.get("description") or "")
+    return kind, date
+
+
 def _walk_page(node, contents, chapters):
     """Recursively collect playable contents and chapter/topic links from a page tree."""
     if isinstance(node, dict):
@@ -627,8 +690,10 @@ def _walk_page(node, contents, chapters):
                 if uri and title and str(uri).startswith("http"):
                     subtitle = node.get("subtitle") or ""
                     name = f"{str(subtitle)[:10]} {title}".strip() if subtitle else title
+                    kind, ldate = _lecture_meta(node, action, d)
                     contents.append({"id": d.get("content_id") or uri, "title": name, "url": uri,
-                                      "section": _content_section(action)})
+                                      "section": _content_section(action),
+                                      "kind": kind, "date": ldate})
         action = node.get("action")
         if isinstance(action, dict):
             action_data = action.get("data") or {}
@@ -791,7 +856,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None, chat_id=None):
             seen.add(it["id"])
             items.append({"id": it["id"], "title": f"{prefix} {it['title']}".strip(), "url": it["url"],
                           "batch": batch_name, "subject": subject, "topic": topic,
-                          "section": it.get("section") or "Other Material"})
+                          "section": it.get("section") or "Other Material",
+                          "kind": it.get("kind") or "", "date": it.get("date") or ""})
 
     for course in courses:
         enrolled_batches = list(dict.fromkeys(str(v) for v in (course.get("enrolled_batches") or []) if v))
@@ -1426,7 +1492,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
     section_index = []  # (subject, chapter, section, message link)
     announced_sections = {}
     os.makedirs(work_dir, exist_ok=True)
-    done = load_done()
+    done = load_done(target_chat_id)
     try:
         remote_done = await load_state_from_channel(app, target_chat_id)
         if remote_done:
@@ -1601,7 +1667,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     caption = build_caption(item, upload_path, dur)
                     await async_upload_to_telegram(app, target_chat_id, upload_path, caption,
                                                    custom_thumb_path or thumb_path, dur, w, h)
-                    mark_done(item["id"], done)
+                    mark_done(item["id"], done, target_chat_id)
                     ok += 1
                     if ok % 25 == 0:
                         asyncio.create_task(save_state_to_channel(app, target_chat_id, done))
