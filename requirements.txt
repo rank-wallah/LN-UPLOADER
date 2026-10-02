@@ -3,3 +3,4 @@ tgcrypto
 requests
 uvloop
 certifi
+psycopg2-binary
