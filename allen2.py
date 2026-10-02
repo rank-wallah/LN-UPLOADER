@@ -2576,11 +2576,73 @@ async def _resolve_batch(bh):
     return None
 
 
+FSUB_CHANNELS = [c.strip() for c in os.getenv("FSUB_CHANNELS", "").split(",") if c.strip()]
+FSUB_LINKS = {}
+
+
+def _fsub_id(c):
+    return int(c) if c.lstrip("-").isdigit() else c
+
+
+async def fsub_missing(client, uid):
+    """Jo channels user ne join nahi kiye (ya leave kar diye) unki list [(title, link)]."""
+    if not FSUB_CHANNELS or uid == OWNER_ID:
+        return []
+    from pyrogram.errors import UserNotParticipant
+    missing = []
+    for c in FSUB_CHANNELS:
+        cid = _fsub_id(c)
+        try:
+            m = await client.get_chat_member(cid, uid)
+            if m.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+                raise UserNotParticipant
+            continue
+        except UserNotParticipant:
+            pass
+        except Exception as e:
+            if "USER_NOT_PARTICIPANT" not in str(e).upper():
+                logger.warning(f"fsub check {c}: {e} (bot ko is channel me admin banao)")
+                continue  # bot ki galti par student ko block mat karo
+        link = FSUB_LINKS.get(c)
+        title = "Channel"
+        try:
+            ch = await client.get_chat(cid)
+            title = ch.title or title
+            if not link:
+                link = ch.invite_link or (f"https://t.me/{ch.username}" if ch.username else None)
+                if not link:
+                    link = await client.export_chat_invite_link(cid)
+                FSUB_LINKS[c] = link
+        except Exception as e:
+            logger.warning(f"fsub link {c}: {e}")
+        missing.append((title, link))
+    return missing
+
+
+async def fsub_prompt(client, uid, missing, edit_msg=None):
+    kb = [[InlineKeyboardButton(f"📢 Join {t}"[:60], url=l)] for t, l in missing if l]
+    kb.append([InlineKeyboardButton("✅ Join kar liya", callback_data="L0")])
+    text = ("<b>🔒 Pehle channel join karo</b>\n━━━━━━━━━━━━━━━━\n"
+            "Lectures tabhi milenge jab aap neeche ke channel(s) join karoge.\n"
+            "Channel chhodoge toh lectures band ho jayenge.\n\n👇 Join karke <b>✅ Join kar liya</b> dabao")
+    if edit_msg is not None:
+        try:
+            await edit_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+            return
+        except Exception:
+            pass
+    await client.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb))
+
+
 @app.on_message(filters.command(["start", "library"]) & filters.private)
 async def handle_library(client, message: Message):
     uid = message.from_user.id if message.from_user else 0
     if not _lib_ok(client, uid):
         await message.reply_text(f"<blockquote><i>🚫 Library access nahi hai. Admin ko apna ID bhejo: <code>{uid}</code></i></blockquote>")
+        return
+    miss = await fsub_missing(client, uid)
+    if miss:
+        await fsub_prompt(client, uid, miss)
         return
     text, kb = await lib_batches(uid)
     await message.reply_text(text, reply_markup=kb)
@@ -2594,6 +2656,14 @@ async def handle_lib_cb(client, cq: CallbackQuery):
         return
     p = cq.data.split("|")
     lvl = p[0]
+    miss = await fsub_missing(client, uid)
+    if miss:
+        try:
+            await cq.answer("🔒 Pehle channel join karo", show_alert=True)
+        except Exception:
+            pass
+        await fsub_prompt(client, uid, miss, cq.message)
+        return
     try:
         if lvl == "L0":
             text, kb = await lib_batches(uid)
