@@ -1,3 +1,4 @@
+import glob
 import os
 import sys
 import json
@@ -1139,7 +1140,7 @@ def prepare_video_for_upload(source_path):
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     # Sanitize odd dimensions, sample aspect ratio and pixel format. Limiting x264
     # threads prevents parallel uploads from exhausting a small Heroku worker.
-    label = ("scale=-2:'min(480\\,trunc(ih/2)*2)',setsar=1,format=yuv420p,"
+    label = ("scale=-2:'min(720\\,trunc(ih/2)*2)',setsar=1,format=yuv420p,"
              "drawtext=fontfile=" + font + ":text=courierWell:"
              "fontcolor=white@0.80:fontsize=max(18\\,h/36):"
              "borderw=2:bordercolor=black@0.60:x=w-tw-24:y=24")
@@ -1149,7 +1150,7 @@ def prepare_video_for_upload(source_path):
                 "-filter_threads", "1", "-i", source_path,
                 "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
                 "-vf", video_filter, "-fps_mode", "vfr",
-                "-c:v", "libx264", "-preset", preset, "-crf", "26", "-tune", "fastdecode",
+                "-c:v", "libx264", "-preset", preset, "-crf", "22",
                 "-pix_fmt", "yuv420p", "-threads", FFMPEG_THREADS,
                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
                 "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
@@ -1183,7 +1184,7 @@ def prepare_video_for_upload(source_path):
             if os.path.exists(video_path):
                 os.remove(video_path)
             # Broken/very large source metadata fallback: normalize to at most 720p.
-            fallback = ("scale='min(854\\,ceil(iw/2)*2)':'min(480\\,ceil(ih/2)*2)':"
+            fallback = ("scale='min(1280\\,ceil(iw/2)*2)':'min(720\\,ceil(ih/2)*2)':"
                         "force_original_aspect_ratio=decrease:force_divisible_by=2,"
                         "setsar=1,format=yuv420p,drawtext=fontfile=" + font +
                         ":text=courierWell:fontcolor=white@0.80:fontsize=max(18\\,h/36):"
@@ -1209,6 +1210,34 @@ def prepare_video_for_upload(source_path):
 
 
 TG_UPLOAD_LIMIT = 1950 * 1024 * 1024  # stay safely under Telegram's 2000 MB cap
+
+
+def split_video(source_path, duration=0):
+    """2GB+ video: quality same rakho (no re-encode), bas time ke hisaab se parts me kaato."""
+    size = os.path.getsize(source_path)
+    if size <= TG_UPLOAD_LIMIT:
+        return [source_path]
+    if not duration:
+        duration = probe_video(source_path)[0] or 0
+    if not duration:
+        raise RuntimeError("Video 2GB se badi hai aur duration nahi mili, split nahi ho payi.")
+    n = int(size // int(TG_UPLOAD_LIMIT * 0.9)) + 1
+    for _ in range(4):
+        seg = max(60, int(duration / n) + 1)
+        stem, _ = os.path.splitext(source_path)
+        pattern = stem + ".part%02d.mp4"
+        for old in glob.glob(stem + ".part*.mp4"):
+            os.remove(old)
+        r = _run(["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-i", source_path,
+                  "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "segment",
+                  "-segment_time", str(seg), "-reset_timestamps", "1",
+                  "-segment_format_options", "movflags=+faststart", pattern],
+                 3600, os.path.dirname(source_path))
+        parts = sorted(glob.glob(stem + ".part*.mp4"))
+        if r.returncode == 0 and parts and all(os.path.getsize(p) <= TG_UPLOAD_LIMIT for p in parts):
+            return parts
+        n += 1
+    raise RuntimeError("Video split fail ho gayi.")
 
 def reduce_video_size(source_path, duration=0):
     """Re-encode only when the file is over the Telegram limit; sized to fit."""
@@ -1743,17 +1772,23 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     dur = w = h = 0
                     if upload_path.lower().endswith((".mp4", ".mkv", ".ts", ".webm", ".mov")):
                         dur, w, h = await asyncio.to_thread(probe_video, upload_path)
-                        if os.path.getsize(upload_path) > TG_UPLOAD_LIMIT:
-                            reduced = await asyncio.to_thread(reduce_video_size, upload_path, dur)
-                            if reduced != upload_path:
-                                upload_path = reduced
-                                video_path = reduced
-                                dur, w, h = await asyncio.to_thread(probe_video, upload_path)
-                    caption = build_caption(item, upload_path, dur)
-                    sent_msg = await async_upload_to_telegram(app, target_chat_id, upload_path, caption,
-                                                   custom_thumb_path or thumb_path, dur, w, h)
-                    if sent_msg is not None:
-                        await asyncio.to_thread(catalog_add, item, target_chat_id, sent_msg.id, idx)
+                    parts = [upload_path]
+                    if os.path.getsize(upload_path) > TG_UPLOAD_LIMIT:
+                        parts = await asyncio.to_thread(split_video, upload_path, dur)
+                    for pn, part in enumerate(parts, 1):
+                        pdur, pw, ph = (dur, w, h) if len(parts) == 1 else await asyncio.to_thread(probe_video, part)
+                        caption = build_caption(item, upload_path, pdur)
+                        pitem = item
+                        if len(parts) > 1:
+                            caption = caption.replace("\nBatch Name :", f"\n<b>Part : {pn}/{len(parts)}</b>\nBatch Name :", 1)
+                            pitem = dict(item, id=f"{item.get('id')}#p{pn}",
+                                         title=f"{item.get('title')} (Part {pn})")
+                        sent_msg = await async_upload_to_telegram(app, target_chat_id, part, caption,
+                                                       custom_thumb_path or thumb_path, pdur, pw, ph)
+                        if sent_msg is not None:
+                            await asyncio.to_thread(catalog_add, pitem, target_chat_id, sent_msg.id, idx)
+                        if part != upload_path and os.path.exists(part):
+                            os.remove(part)
                     mark_done(item["id"], done, target_chat_id)
                     ok += 1
                     if ok % 25 == 0:
