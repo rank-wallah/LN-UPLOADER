@@ -1324,6 +1324,10 @@ async def handle_login(client: Client, message: Message):
         await message.delete()  # credentials wali message turant hatao
     except Exception as e:
         logger.warning(f"/login command delete failed: {e}")
+    if (message.chat.type == enums.ChatType.PRIVATE and " -c " not in args[1]
+            and await get_helper() is not None):
+        await auto_channel_flow(message, username, password)
+        return
     status_msg = await message.reply_text("<blockquote><i>🔑 Authenticating directly with Allen Servers...</i></blockquote>")
 
     try:
@@ -1713,8 +1717,10 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                                 video_path = reduced
                                 dur, w, h = await asyncio.to_thread(probe_video, upload_path)
                     caption = build_caption(item, upload_path, dur)
-                    await async_upload_to_telegram(app, target_chat_id, upload_path, caption,
+                    sent_msg = await async_upload_to_telegram(app, target_chat_id, upload_path, caption,
                                                    custom_thumb_path or thumb_path, dur, w, h)
+                    if sent_msg is not None:
+                        await asyncio.to_thread(catalog_add, item, target_chat_id, sent_msg.id, idx)
                     mark_done(item["id"], done, target_chat_id)
                     ok += 1
                     if ok % 25 == 0:
@@ -2082,6 +2088,429 @@ async def show_id(client: Client, message: Message):
     await message.reply_text(f"<blockquote><i>🆔 Chat ID: <code>{message.chat.id}</code></i></blockquote>")
 
 
+
+# ==========================================
+# AUTO CHANNEL + LECTURE LIBRARY
+# ==========================================
+import hashlib
+import sqlite3
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, CallbackQuery
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USER_SESSION = os.getenv("USER_SESSION", "").strip()
+HELPER = {"client": None}
+CONNECT_FLOW = {}  # owner_id -> {"step", "client", "phone", "hash"}
+CHANNEL_CREATE_LOCK = asyncio.Lock()
+LIB_PAGE = 20
+
+
+def _db():
+    if DATABASE_URL:
+        import psycopg2
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(url, sslmode=os.getenv("DB_SSLMODE", "require")), "%s"
+    return sqlite3.connect(os.path.join(DOWNLOAD_DIR, "..", "library.db")), "?"
+
+
+def db_exec(sql, params=(), fetch=False):
+    conn, ph = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql.replace("%s", ph), params)
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def db_init():
+    stmts = [
+        """CREATE TABLE IF NOT EXISTS accounts (
+            username TEXT PRIMARY KEY, channel_id BIGINT NOT NULL,
+            invite_link TEXT, created_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS catalog (
+            batch_name TEXT NOT NULL, subject TEXT, kind TEXT, chapter TEXT, section TEXT,
+            seq BIGINT, title TEXT, content_key TEXT NOT NULL,
+            channel_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
+            PRIMARY KEY (batch_name, content_key))""",
+        """CREATE TABLE IF NOT EXISTS library_users (user_id BIGINT PRIMARY KEY)""",
+        """CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)""",
+    ]
+    for s in stmts:
+        db_exec(s)
+
+
+def kv_get(k):
+    rows = db_exec("SELECT v FROM kv WHERE k=%s", (k,), fetch=True)
+    return rows[0][0] if rows else None
+
+
+def kv_set(k, v):
+    db_exec("INSERT INTO kv (k, v) VALUES (%s, %s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (k, v))
+
+
+def catalog_add(item, channel_id, message_id, seq):
+    try:
+        batch = str(item.get("batch") or "Allen Batch").strip()
+        subj = str(item.get("subject") or "").strip() or "Other"
+        chapter = str(item.get("topic") or "").strip() or subj
+        key = str(item.get("id") or "") or _title_key(item.get("title"))
+        db_exec("""INSERT INTO catalog (batch_name, subject, kind, chapter, section, seq, title,
+                   content_key, channel_id, message_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                (batch, subj, _kind_label(item.get("kind")), chapter,
+                 str(item.get("section") or ""), int(seq), str(item.get("title") or ""),
+                 key, int(channel_id), int(message_id)))
+    except Exception as e:
+        logger.warning(f"Catalog add failed: {e}")
+
+
+def _h(s):
+    return hashlib.md5(str(s).encode()).hexdigest()[:8]
+
+
+def library_allowed(uid):
+    if uid == OWNER_ID or uid in AUTHORIZED_USERS:
+        return True
+    try:
+        return bool(db_exec("SELECT 1 FROM library_users WHERE user_id=%s", (uid,), fetch=True))
+    except Exception:
+        return False
+
+
+# ---------- helper (user) account ----------
+async def get_helper():
+    if HELPER["client"]:
+        return HELPER["client"]
+    sess = USER_SESSION
+    if not sess:
+        try:
+            sess = await asyncio.to_thread(kv_get, "user_session") or ""
+        except Exception:
+            sess = ""
+    if not sess:
+        return None
+    c = Client("helper_user", api_id=TG_API_ID, api_hash=TG_API_HASH,
+               session_string=sess, in_memory=True, no_updates=True)
+    await c.start()
+    HELPER["client"] = c
+    return c
+
+
+@app.on_message(filters.command("connectuser") & filters.private)
+async def handle_connectuser(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        await message.reply_text("<blockquote><i>🚫 Owner-only command.</i></blockquote>")
+        return
+    CONNECT_FLOW[OWNER_ID] = {"step": "phone"}
+    await message.reply_text(
+        "<blockquote><i>📱 Helper Telegram account ka number bhejo (country code ke saath), jaise "
+        "<code>+919876543210</code>.\nSpare number use karo, main number nahi.\nCancel: <code>/cancel</code></i></blockquote>")
+
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def handle_cancel(client, message: Message):
+    flow = CONNECT_FLOW.pop(message.from_user.id if message.from_user else 0, None)
+    if flow and flow.get("client"):
+        try:
+            await flow["client"].disconnect()
+        except Exception:
+            pass
+    await message.reply_text("<blockquote><i>❎ Cancel ho gaya.</i></blockquote>")
+
+
+@app.on_message(filters.private & filters.text & ~filters.regex(r"^/"), group=1)
+async def handle_connect_steps(client, message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    flow = CONNECT_FLOW.get(uid)
+    if not flow:
+        return
+    from pyrogram.errors import SessionPasswordNeeded
+    text = message.text.strip()
+    try:
+        if flow["step"] == "phone":
+            c = Client("helper_login", api_id=TG_API_ID, api_hash=TG_API_HASH, in_memory=True)
+            await c.connect()
+            sent = await c.send_code(text)
+            flow.update(step="code", client=c, phone=text, hash=sent.phone_code_hash)
+            await message.reply_text(
+                "<blockquote><i>🔢 Telegram ne OTP bheja hai. Code beech me space daal ke bhejo, jaise "
+                "<code>1 2 3 4 5</code> (warna Telegram code block kar deta hai).</i></blockquote>")
+        elif flow["step"] == "code":
+            code = text.replace(" ", "").replace("-", "")
+            try:
+                await flow["client"].sign_in(flow["phone"], flow["hash"], code)
+            except SessionPasswordNeeded:
+                flow["step"] = "password"
+                await message.reply_text("<blockquote><i>🔐 2-Step password bhejo.</i></blockquote>")
+                return
+            await _finish_connect(message, flow)
+        elif flow["step"] == "password":
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await flow["client"].check_password(text)
+            await _finish_connect(message, flow)
+    except Exception as e:
+        CONNECT_FLOW.pop(uid, None)
+        await message.reply_text(f"<blockquote><i>❌ Helper login fail: <code>{html.escape(str(e))}</code>\nDobara <code>/connectuser</code> karo.</i></blockquote>")
+
+
+async def _finish_connect(message, flow):
+    c = flow["client"]
+    sess = await c.export_session_string()
+    await c.disconnect()
+    CONNECT_FLOW.pop(OWNER_ID, None)
+    await asyncio.to_thread(kv_set, "user_session", sess)
+    HELPER["client"] = None
+    await get_helper()
+    await message.reply_text(
+        "<blockquote><i>✅ <b>Helper account connect ho gaya.</b> Ab <code>/login username*password</code> "
+        "bot ke DM me bhejo — channel apne aap banega.</i></blockquote>")
+
+
+async def get_or_create_account_channel(username, title_hint):
+    rows = await asyncio.to_thread(db_exec, "SELECT channel_id, invite_link FROM accounts WHERE username=%s",
+                                   (username,), True)
+    if rows:
+        return int(rows[0][0]), rows[0][1], False
+    helper = await get_helper()
+    if not helper:
+        raise ValueError("Helper account connect nahi hai. Pehle owner <code>/connectuser</code> kare.")
+    async with CHANNEL_CREATE_LOCK:
+        last = float(await asyncio.to_thread(kv_get, "last_channel_at") or 0)
+        wait = 180 - (time.time() - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        chan = await helper.create_channel(f"LN | {title_hint}"[:120], "Courier Well lectures")
+        await asyncio.to_thread(kv_set, "last_channel_at", str(time.time()))
+    me = await app.get_me()
+    await helper.promote_chat_member(chan.id, me.username, privileges=ChatPrivileges(
+        can_manage_chat=True, can_post_messages=True, can_edit_messages=True,
+        can_delete_messages=True, can_pin_messages=True, can_invite_users=True))
+    try:
+        link = await helper.export_chat_invite_link(chan.id)
+    except Exception:
+        link = None
+    await asyncio.to_thread(db_exec,
+                            "INSERT INTO accounts (username, channel_id, invite_link, created_at) VALUES (%s,%s,%s,%s) "
+                            "ON CONFLICT (username) DO NOTHING",
+                            (username, int(chan.id), link, time.strftime("%Y-%m-%d %H:%M")))
+    return int(chan.id), link, True
+
+
+async def auto_channel_flow(message, username, password):
+    """DM /login: account ka channel banao/dhundho, login bind karo, saare batches upload karo."""
+    status = await message.reply_text("<blockquote><i>🔑 Allen login check ho raha hai...</i></blockquote>")
+    try:
+        token = await asyncio.to_thread(allen_login_idpass, username, password, message.chat.id)
+        info = await asyncio.to_thread(fetch_student_info, token, message.chat.id)
+        st = info.get("student_detail") or {}
+        courses = info.get("course_details") or []
+        name = f"{st.get('first_name', '')} {st.get('last_name', '')}".strip() or username
+        course = (courses[0].get("course_name") if courses else "") or "Allen"
+        await status.edit_text("<blockquote><i>📢 Channel ready kiya ja raha hai...</i></blockquote>")
+        chan_id, link, created = await get_or_create_account_channel(username, f"{name} | {course}")
+        token = await asyncio.to_thread(allen_login_idpass, username, password, chan_id)
+        key = _job_key(chan_id, None, None)
+        if ACTIVE_JOBS.get(key, {}).get("running"):
+            await status.edit_text("<blockquote><i>⚠️ Is account ka upload already chal raha hai.</i></blockquote>")
+            return
+        await status.edit_text(
+            f"<blockquote><i>{'🆕 Naya channel bana' if created else '♻️ Purana channel mila'}: <code>{chan_id}</code>\n"
+            + (f"🔗 {link}\n" if link else "")
+            + "🚀 Saare batches upload shuru — sirf bache hue lectures jayenge.</i></blockquote>")
+        job_status = await message.reply_text("<blockquote><i>🔄 Lectures fetch ho rahe hain...</i></blockquote>")
+        asyncio.create_task(run_batch_job(message, token, None, None, chan_id, job_status))
+    except Exception as e:
+        logger.error(f"Auto channel flow failed: {e}")
+        await status.edit_text(f"<blockquote><i>❌ <code>{html.escape(str(e))}</code></i></blockquote>")
+
+
+@app.on_message(filters.command("channels") & filters.private)
+async def handle_channels(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    rows = await asyncio.to_thread(db_exec, "SELECT username, channel_id, invite_link FROM accounts", (), True)
+    if not rows:
+        await message.reply_text("<blockquote><i>Abhi koi auto channel nahi bana.</i></blockquote>")
+        return
+    out = ["<b>📢 Channels</b>"]
+    for u, cid, link in rows:
+        cnt = await asyncio.to_thread(db_exec, "SELECT COUNT(*) FROM catalog WHERE channel_id=%s", (cid,), True)
+        out.append(f"• <code>{html.escape(str(u))}</code> → <code>{cid}</code> | {cnt[0][0]} lectures"
+                   + (f" | <a href=\"{link}\">open</a>" if link else ""))
+    await message.reply_text("\n".join(out)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command(["access", "revoke"]) & filters.private)
+async def handle_access(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.reply_text("<blockquote><i>Usage: <code>/access &lt;user_id&gt;</code> / <code>/revoke &lt;user_id&gt;</code></i></blockquote>")
+        return
+    uid = int(parts[1])
+    if parts[0].lower().startswith("/access"):
+        await asyncio.to_thread(db_exec, "INSERT INTO library_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (uid,))
+        await message.reply_text(f"<blockquote><i>✅ <code>{uid}</code> ko library access mil gaya.</i></blockquote>")
+    else:
+        await asyncio.to_thread(db_exec, "DELETE FROM library_users WHERE user_id=%s", (uid,))
+        await message.reply_text(f"<blockquote><i>❌ <code>{uid}</code> ka access hata diya.</i></blockquote>")
+
+
+@app.on_message(filters.command("importchannel") & (filters.private | filters.channel | filters.group))
+async def handle_importchannel(client, message: Message):
+    if message.from_user and message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    chan = message.chat.id
+    if "-c" in parts:
+        try:
+            chan = int(parts[parts.index("-c") + 1])
+        except Exception:
+            await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad channel ID do.</i></blockquote>")
+            return
+    st = await message.reply_text("<blockquote><i>📥 Channel ke purane lectures library me add ho rahe hain...</i></blockquote>")
+    added = 0
+    try:
+        async for m in app.get_chat_history(chan):
+            cap = (m.caption or "")
+            if not (m.video or m.document) or "File Title :" not in cap:
+                continue
+            fields = {}
+            for line in cap.splitlines():
+                if " : " in line:
+                    k, _, v = line.partition(" : ")
+                    fields[k.strip()] = v.strip()
+            topic = fields.get("Topic Name", "")
+            subj, _, chapter = topic.partition(" - ")
+            item = {"batch": fields.get("Batch Name"), "subject": subj or topic, "topic": chapter or topic,
+                    "kind": fields.get("Type", "Recorded Lecture"), "title": fields.get("File Title"),
+                    "section": "", "id": "t:" + _title_key(fields.get("File Title"))}
+            await asyncio.to_thread(catalog_add, item, chan, m.id, m.id)
+            added += 1
+        await st.edit_text(f"<blockquote><i>✅ {added} lectures library me add ho gaye.</i></blockquote>")
+    except Exception as e:
+        await st.edit_text(f"<blockquote><i>❌ Import fail: <code>{html.escape(str(e))}</code>\nBot channel me admin hona chahiye.</i></blockquote>")
+
+
+# ---------- Library menu ----------
+def _lib_rows(sql, params=()):
+    return db_exec(sql, params, fetch=True) or []
+
+
+def _sort_subjects(names):
+    return sorted(names, key=lambda s: (SUBJECT_ORDER.get(str(s).lower(), 9), str(s).lower()))
+
+
+async def lib_batches(uid):
+    rows = await asyncio.to_thread(_lib_rows, "SELECT DISTINCT batch_name FROM catalog")
+    names = sorted(r[0] for r in rows)
+    if not names:
+        return "📚 Library abhi khaali hai.", None
+    kb = [[InlineKeyboardButton(n[:60], callback_data=f"L1|{_h(n)}")] for n in names]
+    return "📚 <b>Batch chuno</b>", InlineKeyboardMarkup(kb)
+
+
+async def _resolve_batch(bh):
+    rows = await asyncio.to_thread(_lib_rows, "SELECT DISTINCT batch_name FROM catalog")
+    for r in rows:
+        if _h(r[0]) == bh:
+            return r[0]
+    return None
+
+
+@app.on_message(filters.command(["start", "library"]) & filters.private)
+async def handle_library(client, message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    if not library_allowed(uid):
+        await message.reply_text(f"<blockquote><i>🚫 Library access nahi hai. Admin ko apna ID bhejo: <code>{uid}</code></i></blockquote>")
+        return
+    text, kb = await lib_batches(uid)
+    await message.reply_text(text, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^L\d"))
+async def handle_lib_cb(client, cq: CallbackQuery):
+    uid = cq.from_user.id
+    if not library_allowed(uid):
+        await cq.answer("Access nahi hai", show_alert=True)
+        return
+    p = cq.data.split("|")
+    lvl = p[0]
+    try:
+        if lvl == "L0":
+            text, kb = await lib_batches(uid)
+            await cq.message.edit_text(text, reply_markup=kb)
+            return
+        batch = await _resolve_batch(p[1])
+        if not batch:
+            await cq.answer("Batch nahi mila", show_alert=True)
+            return
+        if lvl == "L1":
+            rows = await asyncio.to_thread(_lib_rows, "SELECT DISTINCT subject FROM catalog WHERE batch_name=%s", (batch,))
+            subs = _sort_subjects([r[0] for r in rows])
+            kb = [[InlineKeyboardButton(f"📘 {s}", callback_data=f"L2|{p[1]}|{_h(s)}")] for s in subs]
+            kb.append([InlineKeyboardButton("⬅️ Back", callback_data="L0")])
+            await cq.message.edit_text(f"<b>{html.escape(batch)}</b>\nSubject chuno", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        rows = await asyncio.to_thread(_lib_rows, "SELECT DISTINCT subject FROM catalog WHERE batch_name=%s", (batch,))
+        subj = next((r[0] for r in rows if _h(r[0]) == p[2]), None)
+        if subj is None:
+            await cq.answer("Subject nahi mila", show_alert=True)
+            return
+        if lvl == "L2":
+            kb = [[InlineKeyboardButton("🔴 Live Lectures", callback_data=f"L3|{p[1]}|{p[2]}|L")],
+                  [InlineKeyboardButton("🎬 Recorded Lectures", callback_data=f"L3|{p[1]}|{p[2]}|R")],
+                  [InlineKeyboardButton("⬅️ Back", callback_data=f"L1|{p[1]}")]]
+            await cq.message.edit_text(f"<b>{html.escape(batch)}</b>\n📘 {html.escape(subj)}", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        kind = "Live Lectures" if p[3] == "L" else "Recorded Lectures"
+        rows = await asyncio.to_thread(_lib_rows,
+                                       "SELECT chapter, MIN(seq) FROM catalog WHERE batch_name=%s AND subject=%s AND kind=%s "
+                                       "GROUP BY chapter ORDER BY MIN(seq)", (batch, subj, kind))
+        if lvl == "L3":
+            if not rows:
+                await cq.answer("Is type ke lecture nahi hain", show_alert=True)
+                return
+            kb = [[InlineKeyboardButton(f"{n}. {r[0]}"[:60], callback_data=f"L4|{p[1]}|{p[2]}|{p[3]}|{_h(r[0])}|0")]
+                  for n, r in enumerate(rows, 1)]
+            kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"L2|{p[1]}|{p[2]}")])
+            await cq.message.edit_text(f"<b>{html.escape(batch)}</b>\n📘 {html.escape(subj)} — {kind}\nChapter chuno",
+                                       reply_markup=InlineKeyboardMarkup(kb[:99]))
+            return
+        if lvl == "L4":
+            chapter = next((r[0] for r in rows if _h(r[0]) == p[4]), None)
+            page = int(p[5])
+            items = await asyncio.to_thread(_lib_rows,
+                                            "SELECT channel_id, message_id FROM catalog WHERE batch_name=%s AND subject=%s "
+                                            "AND kind=%s AND chapter=%s ORDER BY seq, message_id",
+                                            (batch, subj, kind, chapter))
+            chunk = items[page * LIB_PAGE:(page + 1) * LIB_PAGE]
+            await cq.answer(f"{len(chunk)} lectures bhej raha hoon...")
+            for cid, mid in chunk:
+                try:
+                    await app.copy_message(uid, int(cid), int(mid))
+                except Exception as e:
+                    logger.warning(f"Library copy failed {cid}/{mid}: {e}")
+                await asyncio.sleep(0.4)
+            if (page + 1) * LIB_PAGE < len(items):
+                await app.send_message(uid, f"Aage ke lectures ({len(items) - (page + 1) * LIB_PAGE} baaki)",
+                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                           "➡️ Next", callback_data=f"L4|{p[1]}|{p[2]}|{p[3]}|{p[4]}|{page + 1}")]]))
+    except Exception as e:
+        logger.error(f"Library callback failed: {e}")
+        try:
+            await cq.answer("Error aaya, dobara try karo", show_alert=True)
+        except Exception:
+            pass
+
+
+
 def main():
     # validate runtime environment and fail fast if missing
     missing = []
@@ -2104,6 +2533,11 @@ def main():
             logger.info("Allen startup check passed: %s Physics items found", len(sample))
         except Exception as e:
             logger.error("Allen startup check failed: %s", e)
+    try:
+        db_init()
+        logger.info("Library DB ready (%s)", "postgres" if DATABASE_URL else "sqlite - restart pe reset hoga")
+    except Exception as e:
+        logger.error("Library DB init failed: %s", e)
     logger.info("Workspace clean. Booting Pyrogram engine...")
     app.run()
 
