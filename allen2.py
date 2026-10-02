@@ -2652,13 +2652,32 @@ async def handle_lib_cb(client, cq: CallbackQuery):
                                             "AND kind=%s AND chapter=%s ORDER BY seq, message_id",
                                             (batch, subj, kind, chapter))
             chunk = items[page * LIB_PAGE:(page + 1) * LIB_PAGE]
+            if not chunk:
+                await cq.answer("Is chapter me abhi lecture nahi hain", show_alert=True)
+                return
             await cq.answer(f"{len(chunk)} lectures bhej raha hoon...")
+            sent, errs = 0, {}
             for cid, mid in chunk:
-                try:
-                    await client.copy_message(uid, int(cid), int(mid))
-                except Exception as e:
-                    logger.warning(f"Library copy failed {cid}/{mid}: {e}")
+                err = await _lib_send(client, uid, int(cid), int(mid))
+                if err is None:
+                    sent += 1
+                else:
+                    errs.setdefault(int(cid), err)
                 await asyncio.sleep(0.4)
+            if errs:
+                await client.send_message(uid, (
+                    f"<blockquote><i>⚠️ {len(chunk) - sent}/{len(chunk)} lecture nahi bhej paya. "
+                    "Admin ko bata diya hai, thodi der baad dobara try karo.</i></blockquote>"))
+                for c, er in errs.items():
+                    try:
+                        await app.send_message(OWNER_ID, (
+                            f"<blockquote><i>⚠️ Library bot channel <code>{c}</code> se lecture nahi bhej paya.\n"
+                            f"Error: <code>{html.escape(er[:300])}</code>\n\n"
+                            f"Fix: us channel me @{LIB.get('username') or 'library bot'} ko admin banao "
+                            "(ya /addlibbot chalao), aur channel settings me "
+                            "<b>Restrict saving content</b> OFF rakho.</i></blockquote>"))
+                    except Exception:
+                        pass
             if (page + 1) * LIB_PAGE < len(items):
                 await client.send_message(uid, f"Aage ke lectures ({len(items) - (page + 1) * LIB_PAGE} baaki)",
                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -2679,6 +2698,62 @@ LIBRARY_PUBLIC = os.getenv("LIBRARY_PUBLIC", "1").strip() != "0"
 LIB = {"client": None, "username": None}
 
 
+async def _lib_send(client, uid, cid, mid):
+    """Lecture student ko bhejo. Fail ho toh peer refresh, library bot ko channel me add, phir retry.
+    Returns None on success, else error text."""
+    last = ""
+    for attempt in range(3):
+        try:
+            await client.copy_message(uid, cid, mid)
+            return None
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            logger.warning(f"Library copy failed {cid}/{mid} (try {attempt + 1}): {last}")
+            if "FLOOD" in last.upper():
+                m = re.search(r"(\d+)\s*seconds", last)
+                await asyncio.sleep(min(int(m.group(1)) if m else 5, 60))
+                continue
+        if attempt == 0:
+            try:
+                await client.get_chat(cid)  # in-memory session ko channel ka pata chale
+            except Exception:
+                pass
+        elif attempt == 1 and client is LIB.get("client"):
+            try:
+                helper = await get_helper()
+                if helper:
+                    await add_libbot_to_channel(helper, cid)
+                    await asyncio.sleep(1)
+                    await client.get_chat(cid)
+            except Exception as e:
+                logger.warning(f"Library bot auto-add {cid}: {e}")
+    if client is not app:
+        try:  # last fallback: upload bot (jo channel me admin hai) se bhejo
+            await app.copy_message(uid, cid, mid)
+            return None
+        except Exception:
+            pass
+    return last
+
+
+async def _lib_autoadd_all():
+    """Startup par library bot ko saare auto-channels me admin bana do (silent)."""
+    await asyncio.sleep(20)
+    try:
+        helper = await get_helper()
+        if not helper or not LIB.get("username"):
+            return
+        rows = await asyncio.to_thread(db_exec, "SELECT DISTINCT channel_id FROM accounts", (), True)
+        for r in rows or []:
+            try:
+                await add_libbot_to_channel(helper, int(r[0]))
+            except Exception as e:
+                logger.warning(f"lib autoadd {r[0]}: {e}")
+            await asyncio.sleep(3)
+    except Exception as e:
+        logger.warning(f"lib autoadd failed: {e}")
+
+
 def _lib_ok(client, uid):
     if LIB.get("client") is not None and client is LIB["client"] and LIBRARY_PUBLIC:
         return True
@@ -2697,6 +2772,7 @@ async def start_library_bot():
         me = await lib.get_me()
         LIB["client"], LIB["username"] = lib, me.username
         logger.info(f"Library bot started: @{me.username}")
+        asyncio.create_task(_lib_autoadd_all())
     except Exception as e:
         logger.error(f"Library bot start failed: {e}")
 
