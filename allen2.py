@@ -162,8 +162,9 @@ def fetch_student_info(token, chat_id=None):
     r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
                      headers=allen_content_headers(token, chat_id), timeout=25)
     if r.status_code == 401:
-        if ALLEN_USERNAME and ALLEN_PASSWORD:
-            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD, chat_id)
+        _t = relogin_for_chat(chat_id)
+        if _t:
+            token = _t
             r = requests.get(f"{ALLEN_BASE_URL}/user/studentInfo",
                              headers=allen_content_headers(token, chat_id), timeout=25)
         if r.status_code == 401:
@@ -593,8 +594,9 @@ def allen_get_page(page_url, token, chat_id=None):
     r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
                       headers=allen_content_headers(token, chat_id), timeout=30)
     if r.status_code == 401:
-        if ALLEN_USERNAME and ALLEN_PASSWORD:
-            token = allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD, chat_id)
+        _t = relogin_for_chat(chat_id)
+        if _t:
+            token = _t
             r = requests.post(ALLEN_PAGE_URL, json={"page_url": page_url},
                               headers=allen_content_headers(token, chat_id), timeout=30)
         if r.status_code == 401:
@@ -1512,7 +1514,8 @@ def sort_for_index(items):
     return sorted(items, key=k)
 
 
-async def run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg):
+async def run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg, quiet=False, result=None):
+    result = result if result is not None else {}
     """Pipeline: parallel downloads feeding a single uploader -> max speed per job.
     Multiple jobs (different batches / channels) can run at the same time."""
     key = _job_key(target_chat_id, batch_id, subject)
@@ -1557,6 +1560,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 "Login/session valid hai—dobara login mat karein. ✅ Batch ID ko <code>/mybatches</code> se check karein.</i></blockquote>")
             return
         pending = sort_for_index(pending)
+        result.update(items=items, pending=len(pending), ok=0, failed=0, failed_titles=[])
         if not pending:
             await status_msg.edit_text("<blockquote><i>✅ Ye sab pehle hi upload ho chuka hai.</i></blockquote>")
             return
@@ -1824,12 +1828,15 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                     await im.pin(disable_notification=True)
                 except Exception:
                     pass
+        result.update(ok=ok, failed=failed, failed_titles=list(failed_titles), stopped=stopped)
         if stopped:
             await message.reply_text(
                 f"<blockquote><i>🛑 Stopped. Uploaded: {ok} | Failed: {failed}</i></blockquote>")
             return
 
         await save_state_to_channel(app, target_chat_id, done)
+        if quiet:
+            return
         if failed_titles:
             txt = "⚠️ Failed list:\n" + "\n".join(failed_titles[:40])
             if len(failed_titles) > 40:
@@ -2314,16 +2321,15 @@ async def auto_channel_flow(message, username, password):
         await status.edit_text("<blockquote><i>📢 Channel ready kiya ja raha hai...</i></blockquote>")
         chan_id, link, created = await get_or_create_account_channel(username, f"{name} | {course}")
         token = await asyncio.to_thread(allen_login_idpass, username, password, chan_id)
-        key = _job_key(chan_id, None, None)
-        if ACTIVE_JOBS.get(key, {}).get("running"):
+        if username in ACCOUNT_RUNNING:
             await status.edit_text("<blockquote><i>⚠️ Is account ka upload already chal raha hai.</i></blockquote>")
             return
         await status.edit_text(
             f"<blockquote><i>{'🆕 Naya channel bana' if created else '♻️ Purana channel mila'}: <code>{chan_id}</code>\n"
             + (f"🔗 {link}\n" if link else "")
             + "🚀 Saare batches upload shuru — sirf bache hue lectures jayenge.</i></blockquote>")
-        job_status = await message.reply_text("<blockquote><i>🔄 Lectures fetch ho rahe hain...</i></blockquote>")
-        asyncio.create_task(run_batch_job(message, token, None, None, chan_id, job_status))
+        await asyncio.to_thread(save_creds, username, password, message.chat.id)
+        asyncio.create_task(run_account_job(username, chan_id, message.chat.id, reason="manual"))
     except Exception as e:
         logger.error(f"Auto channel flow failed: {e}")
         await status.edit_text(f"<blockquote><i>❌ <code>{html.escape(str(e))}</code></i></blockquote>")
@@ -2511,6 +2517,230 @@ async def handle_lib_cb(client, cq: CallbackQuery):
 
 
 
+# ==========================================
+# FULL AUTOMATION: account jobs, retries, resume, 6h auto-check
+# ==========================================
+import base64 as _b64
+from pyrogram import idle
+
+AUTO_INTERVAL = int(os.getenv("AUTO_CHECK_HOURS", "6")) * 3600
+RETRY_ROUNDS = int(os.getenv("RETRY_ROUNDS", "3"))
+RETRY_GAP = int(os.getenv("RETRY_GAP_SEC", "180"))
+ACCOUNT_RUNNING = set()
+AUTO_STATE = {"next_at": 0}
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = os.getenv("CREDS_KEY", "").strip()
+    if not key:
+        key = _b64.urlsafe_b64encode(hashlib.sha256(f"creds:{TG_BOT_TOKEN}".encode()).digest()).decode()
+    return Fernet(key.encode())
+
+
+def auto_db_init():
+    db_exec("""CREATE TABLE IF NOT EXISTS account_creds (
+        username TEXT PRIMARY KEY, password_enc TEXT NOT NULL, notify_chat BIGINT)""")
+    db_exec("""CREATE TABLE IF NOT EXISTS jobs (
+        account TEXT PRIMARY KEY, channel_id BIGINT, status TEXT, current_batch TEXT,
+        done BIGINT DEFAULT 0, total BIGINT DEFAULT 0, updated_at TEXT)""")
+
+
+def save_creds(username, password, notify_chat):
+    enc = _fernet().encrypt(password.encode()).decode()
+    db_exec("INSERT INTO account_creds (username, password_enc, notify_chat) VALUES (%s,%s,%s) "
+            "ON CONFLICT (username) DO UPDATE SET password_enc=EXCLUDED.password_enc, notify_chat=EXCLUDED.notify_chat",
+            (username, enc, int(notify_chat)))
+
+
+def load_creds(username):
+    rows = db_exec("SELECT password_enc, notify_chat FROM account_creds WHERE username=%s", (username,), fetch=True)
+    if not rows:
+        return None, None
+    return _fernet().decrypt(rows[0][0].encode()).decode(), rows[0][1]
+
+
+def chat_creds(chat_id):
+    """Channel ka saved Allen login (auto re-login ke liye)."""
+    try:
+        rows = db_exec("SELECT username FROM accounts WHERE channel_id=%s", (int(chat_id),), fetch=True)
+        if rows:
+            pw, _ = load_creds(rows[0][0])
+            if pw:
+                return rows[0][0], pw
+    except Exception as e:
+        logger.warning(f"chat_creds failed: {e}")
+    return None, None
+
+
+def relogin_for_chat(chat_id):
+    u, p = chat_creds(chat_id) if chat_id is not None else (None, None)
+    if u and p:
+        return allen_login_idpass(u, p, chat_id)
+    if ALLEN_USERNAME and ALLEN_PASSWORD:
+        return allen_login_idpass(ALLEN_USERNAME, ALLEN_PASSWORD, chat_id)
+    return None
+
+
+def job_set(account, **kw):
+    try:
+        cols = dict(kw, updated_at=time.strftime("%Y-%m-%d %H:%M"))
+        db_exec("INSERT INTO jobs (account) VALUES (%s) ON CONFLICT (account) DO NOTHING", (account,))
+        sets = ", ".join(f"{k}=%s" for k in cols)
+        db_exec(f"UPDATE jobs SET {sets} WHERE account=%s", tuple(cols.values()) + (account,))
+    except Exception as e:
+        logger.warning(f"job_set failed: {e}")
+
+
+class _Notifier:
+    """run_batch_job ko message jaisa object chahiye; ye DM/owner ko bhejta hai."""
+    def __init__(self, chat_id):
+        self.chat = type("C", (), {"id": chat_id})()
+        self.from_user = None
+
+    async def reply_text(self, text, **kw):
+        return await app.send_message(self.chat.id, text, **kw)
+
+
+def _account_batches(info):
+    out = []
+    for c in info.get("course_details") or []:
+        for b in c.get("enrolled_batches") or []:
+            if b not in out:
+                out.append(b)
+    return out
+
+
+async def run_account_job(username, chan_id, notify_chat, reason="manual"):
+    if username in ACCOUNT_RUNNING:
+        return
+    ACCOUNT_RUNNING.add(username)
+    notify = _Notifier(notify_chat or OWNER_ID)
+    try:
+        pw, _ = await asyncio.to_thread(load_creds, username)
+        if not pw:
+            await notify.reply_text(f"<blockquote><i>⚠️ <code>{username}</code> ka password saved nahi. Ek baar /login karo.</i></blockquote>")
+            return
+        try:
+            token = await asyncio.to_thread(allen_login_idpass, username, pw, chan_id)
+        except Exception as e:
+            await asyncio.to_thread(job_set, username, status="login_failed")
+            await notify.reply_text(f"<blockquote><i>❌ <code>{username}</code> login fail (password badla?): <code>{html.escape(str(e))}</code></i></blockquote>")
+            return
+        info = await asyncio.to_thread(fetch_student_info, token, chan_id)
+        batches = _account_batches(info) or [None]
+        await asyncio.to_thread(job_set, username, channel_id=int(chan_id), status="running")
+        report = []
+        new_total = 0
+        for b in batches:
+            await asyncio.to_thread(job_set, username, current_batch=str(b))
+            last = None
+            first_total = 0
+            for rnd in range(RETRY_ROUNDS + 2):
+                key = _job_key(chan_id, b, None)
+                if ACTIVE_JOBS.get(key, {}).get("running"):
+                    break
+                st = await app.send_message(notify.chat.id, f"<blockquote><i>🔄 {b or 'Batch'} — round {rnd + 1}</i></blockquote>",
+                                            disable_notification=True)
+                res = {}
+                await run_batch_job(notify, token, b, None, chan_id, st, quiet=True, result=res)
+                try:
+                    await st.delete()
+                except Exception:
+                    pass
+                if res.get("stopped"):
+                    await asyncio.to_thread(job_set, username, status="stopped")
+                    return
+                if rnd == 0:
+                    first_total = res.get("pending", 0)
+                last = res
+                if not res.get("pending") or not res.get("failed"):
+                    break  # sab upload ho gaya (ya kuch pending hi nahi tha)
+                await asyncio.sleep(RETRY_GAP)
+                token = await asyncio.to_thread(relogin_for_chat, chan_id) or token
+            new_total += first_total
+            if last is not None:
+                all_n = len(last.get("items") or [])
+                miss = last.get("failed_titles") or []
+                line = f"• <code>{b}</code>: {all_n - len(miss)}/{all_n} channel me"
+                if miss:
+                    line += "\n   ❗ Nahi aaye: " + html.escape(", ".join(miss[:15]))[:900]
+                report.append(line)
+        await asyncio.to_thread(job_set, username, status="idle")
+        if reason == "manual" or new_total:
+            await notify.reply_text(("<b>📊 Final report</b> (" + html.escape(username) + ")\n" + "\n".join(report))[:4000])
+    except Exception as e:
+        logger.error(f"Account job failed {username}: {e}")
+        await asyncio.to_thread(job_set, username, status="error")
+        try:
+            await notify.reply_text(f"<blockquote><i>❌ Auto job error: <code>{html.escape(str(e))}</code> — next auto-check pe dobara try hoga.</i></blockquote>")
+        except Exception:
+            pass
+    finally:
+        ACCOUNT_RUNNING.discard(username)
+
+
+async def auto_loop():
+    while True:
+        AUTO_STATE["next_at"] = time.time() + AUTO_INTERVAL
+        await asyncio.sleep(AUTO_INTERVAL)
+        if (await asyncio.to_thread(kv_get, "auto_paused")) == "1":
+            continue
+        try:
+            rows = await asyncio.to_thread(db_exec,
+                                           "SELECT a.username, a.channel_id, c.notify_chat FROM accounts a "
+                                           "JOIN account_creds c ON c.username=a.username", (), True)
+            for u, cid, nc in rows or []:
+                await run_account_job(u, int(cid), nc, reason="auto")
+        except Exception as e:
+            logger.error(f"Auto loop failed: {e}")
+
+
+async def resume_jobs():
+    try:
+        rows = await asyncio.to_thread(db_exec,
+                                       "SELECT j.account, j.channel_id, c.notify_chat FROM jobs j "
+                                       "JOIN account_creds c ON c.username=j.account WHERE j.status='running'", (), True)
+        for u, cid, nc in rows or []:
+            logger.info(f"Resuming job for {u}")
+            try:
+                await app.send_message(nc or OWNER_ID, f"<blockquote><i>♻️ Restart ke baad <code>{html.escape(u)}</code> ka upload wahin se continue ho raha hai.</i></blockquote>")
+            except Exception:
+                pass
+            asyncio.create_task(run_account_job(u, int(cid), nc, reason="manual"))
+    except Exception as e:
+        logger.error(f"Resume failed: {e}")
+
+
+@app.on_message(filters.command(["pauseauto", "resumeauto"]) & filters.private)
+async def handle_pauseauto(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    pause = message.text.lower().startswith("/pause")
+    await asyncio.to_thread(kv_set, "auto_paused", "1" if pause else "0")
+    await message.reply_text(f"<blockquote><i>{'⏸ Auto-check band.' if pause else '▶️ Auto-check chalu.'}</i></blockquote>")
+
+
+@app.on_message(filters.command("autostatus") & filters.private)
+async def handle_autostatus(client, message: Message):
+    rows = await asyncio.to_thread(db_exec, "SELECT account, channel_id, status, current_batch, updated_at FROM jobs", (), True)
+    nxt = AUTO_STATE.get("next_at") or 0
+    out = [f"<b>⚙️ Auto jobs</b> — next check: {time.strftime('%d-%m %H:%M', time.localtime(nxt)) if nxt else '?'}"]
+    for a, cid, st, cb, up in rows or []:
+        out.append(f"• <code>{html.escape(str(a))}</code> → <code>{cid}</code> | {st} | {cb or '-'} | {up}")
+    await message.reply_text("\n".join(out)[:4000])
+
+
+async def _boot():
+    await app.start()
+    logger.info("Bot started")
+    asyncio.create_task(resume_jobs())
+    asyncio.create_task(auto_loop())
+    await idle()
+    await app.stop()
+
+
+
 def main():
     # validate runtime environment and fail fast if missing
     missing = []
@@ -2535,11 +2765,12 @@ def main():
             logger.error("Allen startup check failed: %s", e)
     try:
         db_init()
+        auto_db_init()
         logger.info("Library DB ready (%s)", "postgres" if DATABASE_URL else "sqlite - restart pe reset hoga")
     except Exception as e:
         logger.error("Library DB init failed: %s", e)
     logger.info("Workspace clean. Booting Pyrogram engine...")
-    app.run()
+    app.run(_boot())
 
 if __name__ == "__main__":
     main()
