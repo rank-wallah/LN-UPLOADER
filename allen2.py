@@ -79,6 +79,17 @@ def _load_session_store():
                 return {"default": data, "chats": {}}
         except Exception as e:
             logger.error(f"Error reading session: {e}")
+    try:  # redeploy ke baad DB se logins wapas
+        raw = kv_get("allen_sessions")
+        if raw:
+            data = json.loads(raw)
+            with open(SESSION_FILE, "w") as f:
+                json.dump(data, f)
+            data.setdefault("default", {})
+            data.setdefault("chats", {})
+            return data
+    except Exception:
+        pass
     return {"default": {}, "chats": {}}
 
 def _save_session_store(store):
@@ -87,6 +98,10 @@ def _save_session_store(store):
             json.dump(store, f)
     except Exception as e:
         logger.error(f"Error saving session: {e}")
+    try:
+        kv_set("allen_sessions", json.dumps(store))
+    except Exception:
+        pass
 
 def save_allen_session(data, chat_id=None):
     store = _load_session_store()
@@ -1867,6 +1882,58 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+SHUTTING_DOWN = {"v": False}
+
+
+def _mj_load():
+    try:
+        return json.loads(kv_get("manual_jobs") or "{}")
+    except Exception:
+        return {}
+
+
+def _mj_set(k, v):
+    try:
+        d = _mj_load()
+        if v is None:
+            d.pop(k, None)
+        else:
+            d[k] = v
+        kv_set("manual_jobs", json.dumps(d))
+    except Exception as e:
+        logger.warning(f"manual job save failed: {e}")
+
+
+async def _tracked_batch(message, token, batch_id, subject, target_chat_id, status_msg):
+    """/batch job ko DB me yaad rakho — redeploy/restart ke baad apne aap wahin se chalega."""
+    k = f"{target_chat_id}|{batch_id or ''}|{subject or ''}"
+    await asyncio.to_thread(_mj_set, k, {"chat": message.chat.id, "target": target_chat_id,
+                                         "batch": batch_id, "subject": subject})
+    await run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg)
+    if not SHUTTING_DOWN["v"]:
+        await asyncio.to_thread(_mj_set, k, None)
+
+
+async def resume_manual_jobs():
+    jobs = await asyncio.to_thread(_mj_load)
+    for k, j in jobs.items():
+        try:
+            tgt = int(j["target"])
+            token = await asyncio.to_thread(get_or_login_allen_token, False, tgt)
+            note = _Notifier(int(j.get("chat") or tgt))
+            st = await app.send_message(note.chat.id,
+                                        "<blockquote><i>♻️ Restart ke baad upload wahin se continue ho raha hai...</i></blockquote>")
+            asyncio.create_task(_tracked_batch(note, token, j.get("batch"), j.get("subject"), tgt, st))
+        except Exception as e:
+            logger.error(f"Manual resume failed {k}: {e}")
+            try:
+                await app.send_message(int(j.get("chat") or OWNER_ID),
+                                       f"<blockquote><i>⚠️ Restart ke baad job resume nahi hua: <code>{html.escape(str(e))}</code>\n"
+                                       "Is channel me dobara /login karke /batch chalao.</i></blockquote>")
+            except Exception:
+                pass
+
+
 @app.on_message(filters.command(["batch", "downloadall"]) & (filters.group | filters.channel | filters.private))
 async def handle_batch(client: Client, message: Message):
     logger.info(f"/batch triggered by {message.from_user.id if message.from_user else 'Unknown'}")
@@ -1942,7 +2009,7 @@ async def handle_batch(client: Client, message: Message):
         f"<blockquote><i>🔄 <b>Fetching:</b> {scope}\nUpload → {dest}</i></blockquote>")
 
     # fire-and-forget so multiple batches/channels download simultaneously
-    asyncio.create_task(run_batch_job(message, token, batch_id, subject, target_chat_id, status_msg))
+    asyncio.create_task(_tracked_batch(message, token, batch_id, subject, target_chat_id, status_msg))
 
 
 @app.on_message(filters.command("subjects") & (filters.group | filters.channel | filters.private))
@@ -2318,6 +2385,10 @@ async def get_or_create_account_channel(username, title_hint):
         can_manage_chat=True, can_post_messages=True, can_edit_messages=True,
         can_delete_messages=True, can_pin_messages=True, can_invite_users=True))
     try:
+        await add_libbot_to_channel(helper, chan.id)
+    except Exception as e:
+        logger.warning(f"Library bot add failed: {e}")
+    try:
         link = await helper.export_chat_invite_link(chan.id)
     except Exception:
         link = None
@@ -2458,7 +2529,8 @@ async def lib_batches(uid):
     if not names:
         return "📚 Library abhi khaali hai.", None
     kb = [[InlineKeyboardButton(n[:60], callback_data=f"L1|{_h(n)}")] for n in names]
-    return "📚 <b>Batch chuno</b>", InlineKeyboardMarkup(kb)
+    return ("📚 <b>COURIER WELL LIBRARY</b>\n━━━━━━━━━━━━━━━━\n"
+            f"Total batches: <b>{len(names)}</b>\n\n👇 Apna batch chuno"), InlineKeyboardMarkup(kb)
 
 
 async def _resolve_batch(bh):
@@ -2472,7 +2544,7 @@ async def _resolve_batch(bh):
 @app.on_message(filters.command(["start", "library"]) & filters.private)
 async def handle_library(client, message: Message):
     uid = message.from_user.id if message.from_user else 0
-    if not library_allowed(uid):
+    if not _lib_ok(client, uid):
         await message.reply_text(f"<blockquote><i>🚫 Library access nahi hai. Admin ko apna ID bhejo: <code>{uid}</code></i></blockquote>")
         return
     text, kb = await lib_batches(uid)
@@ -2482,7 +2554,7 @@ async def handle_library(client, message: Message):
 @app.on_callback_query(filters.regex(r"^L\d"))
 async def handle_lib_cb(client, cq: CallbackQuery):
     uid = cq.from_user.id
-    if not library_allowed(uid):
+    if not _lib_ok(client, uid):
         await cq.answer("Access nahi hai", show_alert=True)
         return
     p = cq.data.split("|")
@@ -2525,7 +2597,16 @@ async def handle_lib_cb(client, cq: CallbackQuery):
             kb = [[InlineKeyboardButton(f"{n}. {r[0]}"[:60], callback_data=f"L4|{p[1]}|{p[2]}|{p[3]}|{_h(r[0])}|0")]
                   for n, r in enumerate(rows, 1)]
             kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"L2|{p[1]}|{p[2]}")])
-            await cq.message.edit_text(f"<b>{html.escape(batch)}</b>\n📘 {html.escape(subj)} — {kind}\nChapter chuno",
+            tree = []
+            for n, r in enumerate(rows):
+                br = "└──" if n == len(rows) - 1 else "├──"
+                tree.append(f"{br} 📚 {html.escape(str(r[0]))}")
+            head = (f"🔥 <b>{html.escape(batch)}</b> 🔥\n━━━━━━━━━━━━━━━━\n"
+                    f"📘 <b>{html.escape(subj)}</b> — {_kind_emoji(kind)} {kind}\n\n")
+            body = "\n".join(tree)
+            if len(head) + len(body) > 3800:
+                body = body[:3800 - len(head)] + "\n..."
+            await cq.message.edit_text(head + body + "\n\n👇 Chapter chuno, lectures yahin aa jayenge",
                                        reply_markup=InlineKeyboardMarkup(kb[:99]))
             return
         if lvl == "L4":
@@ -2539,12 +2620,12 @@ async def handle_lib_cb(client, cq: CallbackQuery):
             await cq.answer(f"{len(chunk)} lectures bhej raha hoon...")
             for cid, mid in chunk:
                 try:
-                    await app.copy_message(uid, int(cid), int(mid))
+                    await client.copy_message(uid, int(cid), int(mid))
                 except Exception as e:
                     logger.warning(f"Library copy failed {cid}/{mid}: {e}")
                 await asyncio.sleep(0.4)
             if (page + 1) * LIB_PAGE < len(items):
-                await app.send_message(uid, f"Aage ke lectures ({len(items) - (page + 1) * LIB_PAGE} baaki)",
+                await client.send_message(uid, f"Aage ke lectures ({len(items) - (page + 1) * LIB_PAGE} baaki)",
                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                                            "➡️ Next", callback_data=f"L4|{p[1]}|{p[2]}|{p[3]}|{p[4]}|{page + 1}")]]))
     except Exception as e:
@@ -2554,6 +2635,75 @@ async def handle_lib_cb(client, cq: CallbackQuery):
         except Exception:
             pass
 
+
+
+# ---------- Separate library bot (students ke liye ek jagah saare batches) ----------
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+LIBRARY_BOT_TOKEN = os.getenv("LIBRARY_BOT_TOKEN", "").strip()
+LIBRARY_PUBLIC = os.getenv("LIBRARY_PUBLIC", "1").strip() != "0"
+LIB = {"client": None, "username": None}
+
+
+def _lib_ok(client, uid):
+    if LIB.get("client") is not None and client is LIB["client"] and LIBRARY_PUBLIC:
+        return True
+    return library_allowed(uid)
+
+
+async def start_library_bot():
+    if not LIBRARY_BOT_TOKEN:
+        return
+    try:
+        lib = Client("library_bot", api_id=TG_API_ID, api_hash=TG_API_HASH, bot_token=LIBRARY_BOT_TOKEN,
+                     workers=16, parse_mode=enums.ParseMode.HTML, in_memory=True)
+        lib.add_handler(MessageHandler(handle_library, filters.command(["start", "library"]) & filters.private))
+        lib.add_handler(CallbackQueryHandler(handle_lib_cb, filters.regex(r"^L\d")))
+        await lib.start()
+        me = await lib.get_me()
+        LIB["client"], LIB["username"] = lib, me.username
+        logger.info(f"Library bot started: @{me.username}")
+    except Exception as e:
+        logger.error(f"Library bot start failed: {e}")
+
+
+async def add_libbot_to_channel(helper, chan_id):
+    if not LIB.get("username"):
+        return False
+    await helper.promote_chat_member(chan_id, LIB["username"], privileges=ChatPrivileges(
+        can_manage_chat=True, can_post_messages=True))
+    return True
+
+
+@app.on_message(filters.command("addlibbot") & filters.private)
+async def handle_addlibbot(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    if not LIB.get("username"):
+        await message.reply_text("<blockquote><i>⚠️ Library bot chalu nahi hai. Heroku Config Vars me <code>LIBRARY_BOT_TOKEN</code> daalo.</i></blockquote>")
+        return
+    helper = await get_helper()
+    rows = await asyncio.to_thread(db_exec, "SELECT channel_id FROM accounts", (), True)
+    auto_ids = {int(r[0]) for r in rows or []}
+    ok, bad = 0, []
+    for cid in auto_ids:
+        try:
+            if helper and await add_libbot_to_channel(helper, cid):
+                ok += 1
+            else:
+                bad.append(cid)
+        except Exception as e:
+            bad.append(cid)
+            logger.warning(f"addlibbot {cid}: {e}")
+        await asyncio.sleep(2)
+    other = await asyncio.to_thread(db_exec, "SELECT DISTINCT channel_id FROM catalog", (), True)
+    manual = [int(r[0]) for r in other or [] if int(r[0]) not in auto_ids]
+    out = f"✅ @{LIB['username']} {ok} auto channels me add ho gaya."
+    if bad:
+        out += "\n⚠️ Nahi hua: " + ", ".join(f"<code>{c}</code>" for c in bad)
+    if manual:
+        out += ("\n\n📌 In channels me khud @" + LIB["username"] + " ko admin banao:\n"
+                + "\n".join(f"<code>{c}</code>" for c in manual))
+    await message.reply_text(f"<blockquote><i>{out}</i></blockquote>")
 
 
 # ==========================================
@@ -2773,9 +2923,17 @@ async def handle_autostatus(client, message: Message):
 async def _boot():
     await app.start()
     logger.info("Bot started")
+    await start_library_bot()
     asyncio.create_task(resume_jobs())
+    asyncio.create_task(resume_manual_jobs())
     asyncio.create_task(auto_loop())
     await idle()
+    SHUTTING_DOWN["v"] = True  # redeploy: jobs ko "running" hi rehne do taaki wapas chalu ho
+    if LIB.get("client"):
+        try:
+            await LIB["client"].stop()
+        except Exception:
+            pass
     await app.stop()
 
 
