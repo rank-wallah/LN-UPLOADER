@@ -1467,11 +1467,21 @@ def _load_thumbs():
                 return json.load(f)
         except Exception:
             pass
+    try:  # Heroku restart ke baad DB se wapas lao
+        raw = kv_get("thumbs")
+        if raw:
+            data = json.loads(raw)
+            with open(THUMB_FILE, "w") as f:
+                json.dump(data, f)
+            return data
+    except Exception:
+        pass
     return {}
 
 def get_channel_thumb(chat_id):
-    """Telegram file_id of the custom thumbnail set for this channel (or None)."""
-    return _load_thumbs().get(str(chat_id))
+    """Channel ka thumbnail, warna owner ka default thumbnail (sab channels ke liye)."""
+    data = _load_thumbs()
+    return data.get(str(chat_id)) or data.get("default")
 
 def set_channel_thumb(chat_id, file_id):
     data = _load_thumbs()
@@ -1484,6 +1494,10 @@ def set_channel_thumb(chat_id, file_id):
             json.dump(data, f)
     except Exception as e:
         logger.error(f"Error saving thumbnails: {e}")
+    try:
+        kv_set("thumbs", json.dumps(data))
+    except Exception:
+        pass
 
 
 SUBJECT_ORDER = {"physics": 0, "chemistry": 1, "maths": 2, "mathematics": 2, "math": 2, "biology": 3}
@@ -2051,6 +2065,10 @@ async def handle_setthumb(client: Client, message: Message):
     if not photo:
         await message.reply_text("<blockquote><i>⚠️ Ek photo ke saath <code>/setthumb</code> bhejo (caption me) ya kisi photo ko reply karke <code>/setthumb</code> likho.\nChannel ke liye: <code>/setthumb -c &lt;channel_id&gt;</code></i></blockquote>")
         return
+    if target_chat_id == message.chat.id and message.chat.type == enums.ChatType.PRIVATE:
+        set_channel_thumb("default", photo.file_id)
+        await message.reply_text("<blockquote><i>✅ Default thumbnail set — ab har naye/purane channel ke videos par yahi lagega (jinka alag thumbnail set nahi hai).</i></blockquote>")
+        return
     set_channel_thumb(target_chat_id, photo.file_id)
     await message.reply_text(f"<blockquote><i>✅ Custom thumbnail set ho gaya ({'channel ' + str(target_chat_id) if target_chat_id != message.chat.id else 'is chat'} ke liye).</i></blockquote>")
 
@@ -2067,6 +2085,8 @@ async def handle_delthumb(client: Client, message: Message):
             target_chat_id = int(parts[i + 1])
         except Exception:
             return
+    if target_chat_id == message.chat.id and message.chat.type == enums.ChatType.PRIVATE:
+        target_chat_id = "default"
     set_channel_thumb(target_chat_id, None)
     await message.reply_text("<blockquote><i>🗑 Custom thumbnail hata diya. Ab auto thumbnail lagega.</i></blockquote>")
 
@@ -2329,6 +2349,25 @@ async def auto_channel_flow(message, username, password):
             + (f"🔗 {link}\n" if link else "")
             + "🚀 Saare batches upload shuru — sirf bache hue lectures jayenge.</i></blockquote>")
         await asyncio.to_thread(save_creds, username, password, message.chat.id)
+        if not get_channel_thumb(chan_id):
+            pend = {"event": asyncio.Event(), "file_id": None,
+                    "user_id": message.from_user.id if message.from_user else None}
+            PENDING_THUMB[message.chat.id] = pend
+            ask = await message.reply_text(
+                "<blockquote><i>🖼 <b>Is channel ka thumbnail bhejo</b> (ek photo), ya <code>/skip</code>.\n"
+                "Tip: DM me <code>/setthumb</code> (photo ke caption me) bhejoge toh wo sab channels ka default ban jayega. (90 sec wait)</i></blockquote>")
+            try:
+                await asyncio.wait_for(pend["event"].wait(), timeout=90)
+            except asyncio.TimeoutError:
+                pass
+            PENDING_THUMB.pop(message.chat.id, None)
+            try:
+                await ask.delete()
+            except Exception:
+                pass
+            if pend["file_id"]:
+                set_channel_thumb(chan_id, pend["file_id"])
+                await message.reply_text("<blockquote><i>✅ Thumbnail set ho gaya.</i></blockquote>")
         asyncio.create_task(run_account_job(username, chan_id, message.chat.id, reason="manual"))
     except Exception as e:
         logger.error(f"Auto channel flow failed: {e}")
