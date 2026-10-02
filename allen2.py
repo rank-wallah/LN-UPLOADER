@@ -523,6 +523,9 @@ def log_uploaded_message(chat_id, message_id):
 
 
 async def purge_uploaded_messages(client):
+    """DISABLED: purane lectures kabhi delete nahi karne.
+    """
+    return 0
     """Naya /login => pehle upload kiye saare channel messages delete (revoke=True)."""
     log = load_upload_log()
     total = 0
@@ -1325,13 +1328,8 @@ async def handle_login(client: Client, message: Message):
 
     try:
         token = await asyncio.to_thread(allen_login_idpass, username, password, session_chat_id)
-        try:
-            purged = await purge_uploaded_messages(app)
-            logger.info(f"Auto-delete on new login: {purged} message(s) removed")
-        except Exception as pe:
-            logger.warning(f"Auto-delete failed: {pe}")
-            purged = 0
-        purged_note = f"\n🗑️ Purane {purged} uploads channel se delete ho gaye." if purged else ""
+        # Purane uploads kabhi delete nahi hote (kisi bhi channel me).
+        purged_note = ""
         await status_msg.edit_text(f"<blockquote><i>🔎 Login successful. Ab actual lectures verify ho rahe hain...{purged_note}</i></blockquote>")
         sample = await asyncio.to_thread(fetch_batch_contents, None, token, "Physics", session_chat_id)
         if not sample:
