@@ -2850,8 +2850,16 @@ async def start_library_bot():
 async def add_libbot_to_channel(helper, chan_id):
     if not LIB.get("username"):
         return False
-    await helper.promote_chat_member(chan_id, LIB["username"], privileges=ChatPrivileges(
-        can_manage_chat=True, can_post_messages=True))
+    priv = ChatPrivileges(can_manage_chat=True, can_post_messages=True)
+    try:
+        await helper.promote_chat_member(chan_id, LIB["username"], privileges=priv)
+    except Exception as e:
+        if "peer id invalid" not in str(e).lower() and "PEER_ID_INVALID" not in str(e):
+            raise
+        # helper ka in-memory session channel nahi jaanta: dialogs load karke peer cache bharo
+        async for _ in helper.get_dialogs():
+            pass
+        await helper.promote_chat_member(chan_id, LIB["username"], privileges=priv)
     return True
 
 
