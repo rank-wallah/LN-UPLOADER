@@ -325,11 +325,39 @@ def _cpu_count():
         return max(1, os.cpu_count() or 1)
 
 CPU_COUNT = _cpu_count()
+
+
+def _mem_limit_gb():
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(p).read().strip()
+            if v.isdigit() and int(v) < (1 << 50):
+                return int(v) / (1 << 30)
+        except Exception:
+            pass
+    try:  # Heroku sets dyno RAM in MB
+        return int(os.getenv("WEB_MEMORY") or os.getenv("MEMORY_AVAILABLE") or 0) / 1024 or 1.0
+    except Exception:
+        return 1.0
+
+
+MEM_GB = _mem_limit_gb()
+# Heroku host ke CPUs dikhata hai, dyno ke nahi -> RAM ke hisaab se limit karo (crash/restart se bachne ke liye)
+CPU_COUNT = max(1, min(CPU_COUNT, int(MEM_GB * 2) or 1))
 # Auto-scale with the Heroku dyno size: ~1 watermark job per 2 CPUs (min 3).
 AUTO_PARALLEL = max(3, min(16, CPU_COUNT // 2))
-DL_THREADS = os.getenv("DL_THREADS", "48")
+DL_THREADS = os.getenv("DL_THREADS", "16")
 MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", str(AUTO_PARALLEL + 1)))
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", str(max(2, CPU_COUNT // AUTO_PARALLEL)))
+# Saare channels ka total limit (pehle har channel alag 5-6 downloads chalata tha -> RAM full -> bot restart)
+GLOBAL_DOWNLOADS = int(os.getenv("GLOBAL_DOWNLOADS", str(max(2, min(10, int(MEM_GB * 1.5))))))
+_GLOBAL_DL = {"sem": None}
+
+
+def _global_dl_sem():
+    if _GLOBAL_DL["sem"] is None:
+        _GLOBAL_DL["sem"] = asyncio.Semaphore(GLOBAL_DOWNLOADS)
+    return _GLOBAL_DL["sem"]
 
 
 def normalize_subject(raw):
@@ -1130,6 +1158,13 @@ def download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
     raise RuntimeError(f"Download failed. RE: {err[-120:]} | ffmpeg: {ferr[-200:]}")
 
 async def async_download_m3u8(m3u8_url, output_name, bearer_token=None, work_dir=None):
+    async with _global_dl_sem():
+        r = await _async_download_m3u8_inner(m3u8_url, output_name, bearer_token, work_dir)
+    gc.collect()
+    return r
+
+
+async def _async_download_m3u8_inner(m3u8_url, output_name, bearer_token=None, work_dir=None):
     return await asyncio.to_thread(download_m3u8, m3u8_url, output_name, bearer_token, work_dir)
 
 def prepare_video_for_upload(source_path):
