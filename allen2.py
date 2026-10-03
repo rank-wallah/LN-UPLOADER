@@ -3166,6 +3166,99 @@ async def handle_autostatus(client, message: Message):
     await message.reply_text("\n".join(out)[:4000])
 
 
+@app.on_message(filters.command("resetall") & filters.private)
+async def handle_resetall(client, message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].upper() != "CONFIRM":
+        await message.reply_text(
+            "<blockquote><i>⚠️ <b>RESET ALL</b>\n\n"
+            "Ye command:\n"
+            "• Saare auto-bane channels <b>delete</b> kar dega (lectures bhi)\n"
+            "• Saare accounts, catalog, jobs, sessions, thumbnails ka data <b>wipe</b> kar dega\n"
+            "• Chal rahe uploads <b>rok</b> dega\n\n"
+            "Ye wapas nahi hoga. Pakka karna hai toh bhejo:\n"
+            "<code>/resetall CONFIRM</code></i></blockquote>")
+        return
+    # 1) chal rahe jobs roko
+    for k, v in list(ACTIVE_JOBS.items()):
+        v["running"] = False
+        if v.get("work_dir"):
+            try:
+                kill_job_processes(v["work_dir"])
+            except Exception:
+                pass
+        for t in v.get("tasks") or []:
+            if not t.done():
+                t.cancel()
+    ACTIVE_JOBS.clear()
+    ACCOUNT_RUNNING.clear()
+    await message.reply_text("<blockquote><i>🧹 Reset shuru... channels delete ho rahe hain.</i></blockquote>")
+    # 2) channels delete (helper ne banaye the, wahi delete kar sakta hai)
+    chan_ids = set()
+    try:
+        for r in await asyncio.to_thread(db_exec, "SELECT DISTINCT channel_id FROM accounts", (), True) or []:
+            chan_ids.add(int(r[0]))
+        for r in await asyncio.to_thread(db_exec, "SELECT DISTINCT channel_id FROM catalog", (), True) or []:
+            chan_ids.add(int(r[0]))
+    except Exception as e:
+        logger.warning(f"resetall channel list: {e}")
+    helper = await get_helper()
+    deleted, failed = 0, 0
+    for cid in chan_ids:
+        ok = False
+        if helper:
+            try:
+                await helper.delete_channel(cid)
+                ok = True
+            except Exception as e:
+                logger.warning(f"delete_channel {cid}: {e}")
+                try:
+                    async for _ in helper.get_dialogs():
+                        pass
+                    await helper.delete_channel(cid)
+                    ok = True
+                except Exception as e2:
+                    logger.warning(f"delete_channel retry {cid}: {e2}")
+        if not ok:
+            try:
+                await app.leave_chat(cid)
+                ok = True
+            except Exception as e:
+                logger.warning(f"leave_chat {cid}: {e}")
+        if ok:
+            deleted += 1
+        else:
+            failed += 1
+        await asyncio.sleep(2)
+    # 3) DB wipe (user_session = helper login, use bacha ke rakho)
+    try:
+        for tbl in ("accounts", "catalog", "jobs", "account_creds", "library_users"):
+            await asyncio.to_thread(db_exec, f"DELETE FROM {tbl}")
+        await asyncio.to_thread(db_exec, "DELETE FROM kv WHERE k <> %s", ("user_session",))
+    except Exception as e:
+        logger.warning(f"resetall db wipe: {e}")
+    # 4) local files wipe
+    for f in (SESSION_FILE, DONE_FILE, STATE_MSG_FILE, THUMB_FILE):
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+    try:
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    except Exception:
+        pass
+    await message.reply_text(
+        f"<blockquote><i>✅ <b>Reset complete.</b>\n\n"
+        f"• Channels delete: <b>{deleted}</b>\n"
+        f"• Delete na ho sake: <b>{failed}</b> (unhe Telegram me manually delete karo)\n"
+        f"• Saara data wipe ho gaya\n\n"
+        f"Ab fresh start: <code>/login user*pass</code></i></blockquote>")
+
+
 async def _boot():
     await app.start()
     logger.info("Bot started")
