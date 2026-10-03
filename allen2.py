@@ -205,6 +205,28 @@ def get_or_login_allen_token(force_login=False, chat_id=None):
         "<code>/login username*password -c &lt;channel_id&gt;</code> karo, "
         "ya default login ke liye Heroku Config Vars me ALLEN_USERNAME/ALLEN_PASSWORD set karo.")
 
+# Pyrogram bug: restart ke baad bot ka session channel bhool jata hai ("Peer id invalid").
+# Channel ko access_hash=0 se fetch karke cache me daalo, phir dobara resolve karo.
+from pyrogram import raw as _raw, utils as _putils
+_orig_resolve_peer = Client.resolve_peer
+
+
+async def _resolve_peer_fixed(self, peer_id):
+    try:
+        return await _orig_resolve_peer(self, peer_id)
+    except Exception as e:
+        if not isinstance(peer_id, int) or "peer id invalid" not in str(e).lower():
+            raise
+        if _putils.get_peer_type(peer_id) != "channel":
+            raise
+        r = await self.invoke(_raw.functions.channels.GetChannels(
+            id=[_raw.types.InputChannel(channel_id=_putils.get_channel_id(peer_id), access_hash=0)]))
+        await self.fetch_peers(getattr(r, "chats", []))
+        return await _orig_resolve_peer(self, peer_id)
+
+
+Client.resolve_peer = _resolve_peer_fixed
+
 app = Client(
     "allen_downloader_bot",
     api_id=TG_API_ID,
