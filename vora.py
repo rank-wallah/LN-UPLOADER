@@ -1,6 +1,34 @@
 """Vora Classes (Appx / classx) downloader: login, courses, folder tree, video unlock + download."""
 import base64, hashlib, json, os, re, subprocess, time, concurrent.futures as cf
+import threading
 import requests
+from requests.adapters import HTTPAdapter
+
+# Vora API 429 deta hai agar bahut tez calls hon -> sab clients ke liye ek shared rate limit
+API_GAP = float(os.getenv("VORA_API_GAP", "1.2"))
+_API_LOCK = threading.Lock()
+_API_LAST = [0.0]
+
+
+class VoraBlocked(RuntimeError):
+    """'logging into too many devices' -> account 10 min blocked. Re-login mat karo, wait karo."""
+
+
+class VoraAuthError(RuntimeError):
+    """Token expire / invalid -> sirf isi case me re-login."""
+
+
+def _throttle():
+    with _API_LOCK:
+        wait = _API_LAST[0] + API_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _API_LAST[0] = time.time()
+
+
+def _is_block(msg):
+    m = (msg or "").lower()
+    return "too many devices" in m or "blocked for" in m
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 VORA_HOST = "https://voraclassesapi.classx.co.in"
@@ -36,18 +64,43 @@ class Vora:
         self.s.headers.update({"User-ID": str(self.userid), "Authorization": self.token})
 
     def login(self, email, password):
+        _throttle()
         r = self.s.post(f"{VORA_HOST}/post/userLogin", data={"email": email, "password": password}, timeout=30).json()
         if r.get("status") != 200:
-            raise RuntimeError(r.get("message") or "Vora login failed")
+            msg = r.get("message") or "Vora login failed"
+            raise (VoraBlocked if _is_block(msg) else RuntimeError)(msg)
         d = r["data"]
         self.userid, self.token = d["userid"], d["token"]
         self._auth()
         return {"userid": self.userid, "token": self.token, "name": d.get("name", "")}
 
     def get(self, path):
-        r = self.s.get(f"{VORA_HOST}/{path}", timeout=40)
-        r.raise_for_status()
-        return r.json()
+        delay = 5
+        for attempt in range(7):
+            _throttle()
+            try:
+                r = self.s.get(f"{VORA_HOST}/{path}", timeout=40)
+            except requests.RequestException:
+                if attempt == 6:
+                    raise
+                time.sleep(delay); delay = min(delay * 2, 90)
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                ra = r.headers.get("Retry-After")
+                time.sleep(int(ra) if ra and ra.isdigit() else delay)
+                delay = min(delay * 2, 90)
+                continue
+            if r.status_code in (401, 403):
+                raise VoraAuthError(f"Vora auth {r.status_code}")
+            r.raise_for_status()
+            j = r.json()
+            st, msg = j.get("status"), str(j.get("message") or "")
+            if _is_block(msg):
+                raise VoraBlocked(msg)
+            if st in (401, 403) or "token" in msg.lower() and ("expire" in msg.lower() or "invalid" in msg.lower()):
+                raise VoraAuthError(msg or f"Vora auth {st}")
+            return j
+        raise RuntimeError(f"Vora API busy (429) after retries: {path.split('?')[0]}")
 
     def courses(self):
         out = []
@@ -82,7 +135,22 @@ class Vora:
         hdr = {"User-Agent": UA, "Referer": VORA_REFERER, "Origin": VORA_REFERER.rstrip("/"),
                "Cookie": f"appxplayer={v.get('cookie_value', '')}"}
         base = v.get("download_url_lower_version") or "https://appx-play.classx.co.in/combined-img-player?isMobile=true&videoPlayer=hls&token="
-        page = requests.get(base + v["video_player_token"], headers=hdr, timeout=40).text.replace('\\"', '"')
+        if not v.get("video_player_token"):
+            raise RuntimeError("Vora video not available (no player token)")
+        page = ""
+        for attempt in range(5):
+            try:
+                rp = requests.get(base + v["video_player_token"], headers=hdr, timeout=40)
+                if rp.status_code == 429:
+                    time.sleep(5 * (attempt + 1)); continue
+                page = rp.text.replace('\\"', '"')
+                if '"kstr"' in page:
+                    break
+            except requests.RequestException:
+                pass
+            time.sleep(3 * (attempt + 1))
+        if '"kstr"' not in page:
+            raise RuntimeError("Vora player page did not load")
         dt = re.search(r'"datetime":"(\d+)"', page).group(1)
         tok = re.search(r'"token":"([0-9a-f]+)"', page).group(1)
         iv = base64.b64decode(re.search(r'"ivb6":"([^"]+)"', page).group(1))
@@ -94,24 +162,46 @@ class Vora:
         manifest = _aes_cbc(k, iv, base64.b64decode(m.group(2))).decode()
         return v, hdr, aes_key, manifest
 
-    _B64 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
-    _MASKS = (lambda o: o - 20, lambda o: (o >> 3) ^ 42)   # .tsa style, .tsb style
+    _B64 = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=-_\n\r")
+    _MASKS = (lambda o: o, lambda o: o - 20, lambda o: (o >> 3) ^ 42)   # plain, .tsa style, .tsb style
 
     @staticmethod
     def _unmask(t):
         """Appx segment text masks differ per video; pick the one that yields base64."""
         sample = t[:4000]
+        best, best_score = None, 0.0
         for f in Vora._MASKS:
             try:
-                if all(chr(f(ord(c))) in Vora._B64 for c in sample):
-                    return "".join(chr(f(ord(c))) for c in t).replace("\n", "").replace("\r", "")
+                ok = sum(1 for c in sample if 0 <= f(ord(c)) < 0x110000 and chr(f(ord(c))) in Vora._B64)
             except (ValueError, OverflowError):
                 continue
-        raise ValueError("Unknown Vora segment format")
+            score = ok / max(1, len(sample))
+            if score > best_score:
+                best, best_score = f, score
+        if best is None or best_score < 0.98:
+            raise ValueError(f"Unknown Vora segment format ({best_score:.2f})")
+        out = []
+        for c in t:
+            try:
+                ch = chr(best(ord(c)))
+            except (ValueError, OverflowError):
+                continue
+            if ch in Vora._B64 and ch not in "\n\r":
+                out.append(ch)
+        txt = "".join(out).replace("-", "+").replace("_", "/")
+        return txt + "=" * (-len(txt) % 4)
 
     @staticmethod
     def _seg(raw, key, iv):
-        b = base64.b64decode(Vora._unmask(raw.decode()))
+        if raw[:1] == b"\x47" and len(raw) % 188 == 0:      # already plain TS
+            return bytearray(raw)
+        try:
+            txt = raw.decode()
+            b = base64.b64decode(Vora._unmask(txt))
+        except (UnicodeDecodeError, ValueError):
+            if len(raw) % 16:                                  # not text, not AES blocks -> really bad
+                raise ValueError(f"Unknown Vora segment format (len {len(raw)}, head {raw[:16]!r})")
+            b = raw                                            # raw AES bytes
         d = bytearray(_aes_cbc(key, iv, b))
         for i in range(0, len(d) - 187, 188):           # undo per-packet inversion
             if d[i] != 0x47:
@@ -153,16 +243,23 @@ class Vora:
         iv = bytes.fromhex(re.search(r"IV=0x([0-9a-fA-F]+)", man).group(1))
         segs = [l for l in man.splitlines() if l and not l.startswith("#")]
         sess = requests.Session(); sess.headers.update(hdr)
+        ad = HTTPAdapter(pool_connections=threads + 4, pool_maxsize=threads + 4)
+        sess.mount("https://", ad); sess.mount("http://", ad)
         segs, quality = self._best_quality(sess, segs)
 
         def fetch(u):
-            for _ in range(4):
+            err = None
+            for attempt in range(6):
                 try:
-                    r = sess.get(u, timeout=60); r.raise_for_status()
+                    r = sess.get(u, timeout=60)
+                    if r.status_code == 429:
+                        time.sleep(3 * (attempt + 1)); continue
+                    r.raise_for_status()
                     return self._seg(r.content, key, iv)
                 except Exception as e:
                     err = e
-            raise err
+                    time.sleep(1 + attempt)
+            raise err or RuntimeError("segment fetch failed")
         ts = out_mp4 + ".ts"
         with open(ts, "wb") as f, cf.ThreadPoolExecutor(threads) as ex:
             st = {}
@@ -170,8 +267,12 @@ class Vora:
                 f.write(self._fix_ts(part, st))
                 if progress:
                     progress(n, len(segs))
+        if not segs or os.path.getsize(ts) < 1024:
+            raise RuntimeError("Vora download empty")
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", ts, "-c", "copy", "-movflags", "+faststart", out_mp4], check=True)
         os.remove(ts)
+        if not os.path.exists(out_mp4) or os.path.getsize(out_mp4) < 1024:
+            raise RuntimeError("Vora download empty after ffmpeg")
         return {"title": v.get("Title", ""), "segments": len(segs), "path": out_mp4, "quality": quality}
 
     @staticmethod
