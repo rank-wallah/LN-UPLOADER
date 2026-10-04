@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     tar \
     ca-certificates \
+    libicu-dev \
+    libssl-dev \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -16,6 +18,13 @@ RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_
     && mv N_m3u8DL-RE /usr/local/bin/ \
     && chmod +x /usr/local/bin/N_m3u8DL-RE \
     && rm -rf re.tar.gz
+
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    TERM=xterm-256color \
+    PYTHONUNBUFFERED=1
+
+# Fail the build if the video downloader can't run
+RUN N_m3u8DL-RE --version
 
 WORKDIR /app
 
