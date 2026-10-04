@@ -1047,6 +1047,9 @@ def download_file(url, output_path):
             for chunk in r.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
+    if os.path.getsize(output_path) == 0:
+        os.remove(output_path)
+        raise RuntimeError("Downloaded file is empty (0 B)")
     return output_path
 
 
@@ -1754,6 +1757,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
         refresh_lock = asyncio.Lock()
 
         async def refresh_url(item):
+            # Vora links (vora://) kabhi expire nahi hote; poora folder tree dobara padhna = 429 + block
+            if str(batch_id or "").startswith("vora:"):
+                return item.get("url")
             async with refresh_lock:
                 if time.time() - fresh_cache["at"] > 600:
                     try:
@@ -3335,13 +3341,43 @@ def vora_client(chat_id, fresh=False):
     return v
 
 
+VORA_LOGIN_GAP = int(os.getenv("VORA_LOGIN_GAP", "900"))   # 15 min me max 1 re-login (device-limit block se bachne ke liye)
+VORA_BLOCK_WAIT = int(os.getenv("VORA_BLOCK_WAIT", "660"))
+_VORA_RELOGIN = {"lock": __import__("threading").Lock(), "at": {}, "blocked_until": {}}
+
+
+def _vora_wait_block(chat_id):
+    until = _VORA_RELOGIN["blocked_until"].get(str(chat_id), 0)
+    if until > time.time():
+        time.sleep(until - time.time())
+
+
 def _vora_call(chat_id, fn):
-    """Saved token use karo; token expire ho toh ek baar saved password se re-login."""
-    try:
-        return fn(vora_client(chat_id))
-    except Exception as e:
-        logger.warning(f"Vora call failed, re-login: {e}")
-        return fn(vora_client(chat_id, fresh=True))
+    """Saved token use karo. Re-login SIRF jab token expire ho (aur 15 min me ek hi baar).
+    429 / segment errors par kabhi login nahi -> 'too many devices' block nahi lagega.
+    Block lag gaya toh sab downloads 11 min ruk kar wahin se continue."""
+    k = str(chat_id)
+    for attempt in range(3):
+        _vora_wait_block(chat_id)
+        try:
+            return fn(vora_client(chat_id))
+        except _vora.VoraBlocked as e:
+            logger.warning(f"Vora account blocked, {VORA_BLOCK_WAIT}s wait: {e}")
+            _VORA_RELOGIN["blocked_until"][k] = time.time() + VORA_BLOCK_WAIT
+        except _vora.VoraAuthError as e:
+            with _VORA_RELOGIN["lock"]:
+                last = _VORA_RELOGIN["at"].get(k, 0)
+                if time.time() - last > VORA_LOGIN_GAP:
+                    logger.warning(f"Vora token expired, re-login once: {e}")
+                    _VORA_RELOGIN["at"][k] = time.time()
+                    try:
+                        vora_client(chat_id, fresh=True)
+                    except _vora.VoraBlocked as be:
+                        _VORA_RELOGIN["blocked_until"][k] = time.time() + VORA_BLOCK_WAIT
+                        logger.warning(f"Vora re-login blocked: {be}")
+                else:
+                    VORA_CLIENTS.pop(k, None)   # dusre thread ne abhi login kiya hai -> naya token lo
+    return fn(vora_client(chat_id))
 
 
 def vora_fetch_items(batch_id, chat_id):
@@ -3359,15 +3395,28 @@ def _fetch_items(batch_id, token, subject, chat_id):
     return fetch_batch_contents(batch_id, token, subject, chat_id)
 
 
+VORA_PARALLEL = int(os.getenv("VORA_PARALLEL", "4"))
+_VORA_SEM = {"sem": None}
+
+
+def _vora_sem():
+    if _VORA_SEM["sem"] is None:
+        _VORA_SEM["sem"] = asyncio.Semaphore(VORA_PARALLEL)
+    return _VORA_SEM["sem"]
+
+
 async def vora_download(url, clean, work_dir, chat_id):
     course_id, video_id = url[len("vora://"):].split("/", 1)
     out = os.path.join(work_dir, clean + ".mp4")
     threads = max(4, int(DL_THREADS))
-    async with _global_dl_sem():
-        r = await asyncio.to_thread(
-            _vora_call, chat_id, lambda v: v.download_video(course_id, video_id, out, threads=threads))
+    async with _vora_sem():              # Vora ka server zyada parallel par 429 deta hai
+        async with _global_dl_sem():
+            r = await asyncio.to_thread(
+                _vora_call, chat_id, lambda v: v.download_video(course_id, video_id, out, threads=threads))
     logger.info(f"Vora video {video_id}: {r.get('quality')} {r.get('segments')} segments")
     gc.collect()
+    if not os.path.exists(out) or os.path.getsize(out) < 1024:
+        raise RuntimeError("Vora video empty")
     return out
 
 
