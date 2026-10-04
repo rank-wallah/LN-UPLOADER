@@ -1213,7 +1213,7 @@ def prepare_video_for_upload(source_path):
                 "-max_muxing_queue_size", "4096", "-movflags", "+faststart",
                 video_path]
 
-    if os.getenv("WATERMARK_MODE", "fast").lower() != "burn":
+    if os.getenv("WATERMARK_MODE", "burn" if CPU_COUNT >= 6 else "fast").lower() != "burn":
         # FAST mode: no re-encode (stream copy) - watermark only on thumbnail.
         try:
             result = _run(["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-i", source_path,
