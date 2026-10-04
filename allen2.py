@@ -3312,7 +3312,18 @@ def _vs_get(chat_id):
     return d.get(str(chat_id)) or d.get("default")
 
 
-def vora_login(chat_id, email, password):
+def vora_login(chat_id, email, password, force=False):
+    # Pehle saved login try karo -> naya device login nahi = block nahi
+    rec = _vs_get(chat_id)
+    if not force and rec and rec.get("email") == email:
+        try:
+            v = _vora.Vora({"userid": rec["userid"], "token": rec["token"]})
+            v.courses()
+            d = _vs_load(); d[str(chat_id)] = rec; _vs_save(d)
+            VORA_CLIENTS[str(chat_id)] = v
+            return {"userid": rec["userid"], "token": rec["token"], "name": rec.get("name", "")}
+        except Exception as e:
+            logger.info(f"Saved Vora token not usable, fresh login: {e}")
     v = _vora.Vora()
     info = v.login(email, password)
     d = _vs_load()
@@ -3334,7 +3345,7 @@ def vora_client(chat_id, fresh=False):
         raise RuntimeError("Vora login nahi hai. Pehle /vlogin email:password bhejo.")
     if fresh:
         pw = _fernet().decrypt(rec["pw"].encode()).decode()
-        vora_login(chat_id, rec["email"], pw)
+        vora_login(chat_id, rec["email"], pw, force=True)
         return VORA_CLIENTS[k]
     v = _vora.Vora({"userid": rec["userid"], "token": rec["token"]})
     VORA_CLIENTS[k] = v
