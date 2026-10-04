@@ -1040,7 +1040,8 @@ def fetch_batch_contents(batch_id=None, token=None, subject=None, chat_id=None):
 
 
 def download_file(url, output_path):
-    with requests.get(url, stream=True, timeout=120) as r:
+    hdr = {"Referer": "https://voraclasses.classx.co.in/"} if "appx" in url or "classx" in url else {}
+    with requests.get(url, stream=True, timeout=120, headers=hdr) as r:
         r.raise_for_status()
         with open(output_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
@@ -1666,7 +1667,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             custom_thumb_path = None
 
     try:
-        items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject, target_chat_id)
+        items = await asyncio.to_thread(_fetch_items, batch_id, token, subject, target_chat_id)
         pending = [i for i in items
                    if i["id"] not in done and _title_key(i.get("title")) not in chan_titles]
         if not items:
@@ -1715,7 +1716,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                 try:
                     if not url:
                         raise ValueError("Lecture URL missing")
-                    if ".m3u8" in url:
+                    if url.startswith("vora://"):
+                        path = await vora_download(url, clean, work_dir, target_chat_id)
+                    elif ".m3u8" in url:
                         path = await async_download_m3u8(url, clean, token, work_dir)
                     else:
                         ext = os.path.splitext(url.split("?")[0])[1] or ".pdf"
@@ -1731,7 +1734,9 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
                         fresh = await refresh_url(item)
                         if fresh and fresh != url:
                             item["url"] = fresh
-                            if ".m3u8" in fresh:
+                            if fresh.startswith("vora://"):
+                                path = await vora_download(fresh, clean, work_dir, target_chat_id)
+                            elif ".m3u8" in fresh:
                                 path = await async_download_m3u8(fresh, clean, token, work_dir)
                             else:
                                 ext = os.path.splitext(fresh.split("?")[0])[1] or ".pdf"
@@ -1752,7 +1757,7 @@ async def run_batch_job(message, token, batch_id, subject, target_chat_id, statu
             async with refresh_lock:
                 if time.time() - fresh_cache["at"] > 600:
                     try:
-                        new_items = await asyncio.to_thread(fetch_batch_contents, batch_id, token, subject, target_chat_id)
+                        new_items = await asyncio.to_thread(_fetch_items, batch_id, token, subject, target_chat_id)
                         fresh_cache["map"] = {i["id"]: i.get("url") for i in new_items}
                         fresh_cache["at"] = time.time()
                         logger.info(f"Refreshed {len(new_items)} lecture links")
@@ -2011,7 +2016,10 @@ async def resume_manual_jobs():
     for k, j in jobs.items():
         try:
             tgt = int(j["target"])
-            token = await asyncio.to_thread(get_or_login_allen_token, False, tgt)
+            if str(j.get("batch") or "").startswith("vora:"):
+                token = ""
+            else:
+                token = await asyncio.to_thread(get_or_login_allen_token, False, tgt)
             note = _Notifier(int(j.get("chat") or tgt))
             st = await app.send_message(note.chat.id,
                                         "<blockquote><i>♻️ Restart ke baad upload wahin se continue ho raha hai...</i></blockquote>")
@@ -2701,6 +2709,9 @@ async def handle_library(client, message: Message):
     if miss:
         await fsub_prompt(client, uid, miss)
         return
+    if client is app and is_user_authorized(uid) and (message.text or "").startswith("/start"):
+        await message.reply_text(PANEL_TEXT, reply_markup=PANEL_KB)
+        return
     text, kb = await lib_batches(uid)
     await message.reply_text(text, reply_markup=kb)
 
@@ -3257,6 +3268,249 @@ async def handle_resetall(client, message: Message):
         f"• Delete na ho sake: <b>{failed}</b> (unhe Telegram me manually delete karo)\n"
         f"• Saara data wipe ho gaya\n\n"
         f"Ab fresh start: <code>/login user*pass</code></i></blockquote>")
+
+
+# ======================= VORA CLASSES (Appx) =======================
+import vora as _vora
+
+VORA_CLIENTS = {}          # chat_id -> Vora client (cached, avoids re-login = device-limit block)
+VORA_LOCK = asyncio.Lock()
+
+
+def _vs_load():
+    try:
+        return json.loads(kv_get("vora_sessions") or "{}")
+    except Exception:
+        try:
+            with open("vora_sessions.json") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+
+def _vs_save(d):
+    raw = json.dumps(d)
+    try:
+        kv_set("vora_sessions", raw)
+    except Exception:
+        pass
+    try:
+        with open("vora_sessions.json", "w") as f:
+            f.write(raw)
+    except Exception:
+        pass
+
+
+def _vs_get(chat_id):
+    d = _vs_load()
+    return d.get(str(chat_id)) or d.get("default")
+
+
+def vora_login(chat_id, email, password):
+    v = _vora.Vora()
+    info = v.login(email, password)
+    d = _vs_load()
+    rec = {"userid": info["userid"], "token": info["token"], "name": info.get("name", ""),
+           "email": email, "pw": _fernet().encrypt(password.encode()).decode()}
+    d[str(chat_id)] = rec
+    d.setdefault("default", rec)
+    _vs_save(d)
+    VORA_CLIENTS[str(chat_id)] = v
+    return info
+
+
+def vora_client(chat_id, fresh=False):
+    k = str(chat_id)
+    if not fresh and k in VORA_CLIENTS:
+        return VORA_CLIENTS[k]
+    rec = _vs_get(chat_id)
+    if not rec:
+        raise RuntimeError("Vora login nahi hai. Pehle /vlogin email:password bhejo.")
+    if fresh:
+        pw = _fernet().decrypt(rec["pw"].encode()).decode()
+        vora_login(chat_id, rec["email"], pw)
+        return VORA_CLIENTS[k]
+    v = _vora.Vora({"userid": rec["userid"], "token": rec["token"]})
+    VORA_CLIENTS[k] = v
+    return v
+
+
+def _vora_call(chat_id, fn):
+    """Saved token use karo; token expire ho toh ek baar saved password se re-login."""
+    try:
+        return fn(vora_client(chat_id))
+    except Exception as e:
+        logger.warning(f"Vora call failed, re-login: {e}")
+        return fn(vora_client(chat_id, fresh=True))
+
+
+def vora_fetch_items(batch_id, chat_id):
+    cid = str(batch_id).split(":", 1)[1]
+    courses = _vora_call(chat_id, lambda v: v.courses())
+    name = next((c["name"] for c in courses if c["id"] == cid), f"Vora Course {cid}")
+    items = _vora_call(chat_id, lambda v: v.bot_items(cid, name))
+    logger.info(f"Vora course {cid} ({name}): {len(items)} items")
+    return items
+
+
+def _fetch_items(batch_id, token, subject, chat_id):
+    if str(batch_id or "").startswith("vora:"):
+        return vora_fetch_items(batch_id, chat_id)
+    return fetch_batch_contents(batch_id, token, subject, chat_id)
+
+
+async def vora_download(url, clean, work_dir, chat_id):
+    course_id, video_id = url[len("vora://"):].split("/", 1)
+    out = os.path.join(work_dir, clean + ".mp4")
+    threads = max(4, int(DL_THREADS))
+    async with _global_dl_sem():
+        r = await asyncio.to_thread(
+            _vora_call, chat_id, lambda v: v.download_video(course_id, video_id, out, threads=threads))
+    logger.info(f"Vora video {video_id}: {r.get('quality')} {r.get('segments')} segments")
+    gc.collect()
+    return out
+
+
+def _target_from(parts, default):
+    if "-c" in parts:
+        i = parts.index("-c")
+        tgt = int(parts[i + 1])
+        return tgt, parts[:i] + parts[i + 2:]
+    return default, parts
+
+
+@app.on_message(filters.command("vlogin") & (filters.group | filters.channel | filters.private))
+async def handle_vlogin(client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        return
+    try:
+        tgt, parts = _target_from((message.text or "").split()[1:], message.chat.id)
+    except Exception:
+        await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+        return
+    raw = " ".join(parts).strip()
+    m = re.match(r"^(\S+?)[:*](\S+)$", raw)
+    _schedule_delete(message.chat.id, message.id, 5)
+    if not m:
+        await message.reply_text("<blockquote><i>Use: <code>/vlogin email:password</code> [-c channel_id]</i></blockquote>")
+        return
+    st = await message.reply_text("<blockquote><i>🔐 Vora login ho raha hai...</i></blockquote>")
+    try:
+        info = await asyncio.to_thread(vora_login, tgt, m.group(1), m.group(2))
+        courses = await asyncio.to_thread(_vora_call, tgt, lambda v: v.courses())
+    except Exception as e:
+        await st.edit_text(f"<blockquote><i>❌ Vora login fail: <code>{html.escape(str(e))}</code></i></blockquote>")
+        return
+    lines = [f"✅ <b>Vora login ho gaya</b> — {html.escape(info.get('name') or '')}",
+             f"Channel: <code>{tgt}</code>", "", "<b>Batches:</b>"]
+    lines += [f"<code>{c['id']}</code> — {html.escape(c['name'])}" for c in courses[:60]]
+    lines += ["", f"Upload: <code>/vbatch &lt;ID&gt; -c {tgt}</code>  ya sab: <code>/vbatch all -c {tgt}</code>"]
+    await st.edit_text("\n".join(lines)[:MAX_TG_MSG_LEN])
+
+
+@app.on_message(filters.command("vbatches") & (filters.group | filters.channel | filters.private))
+async def handle_vbatches(client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        return
+    try:
+        tgt, _ = _target_from((message.text or "").split()[1:], message.chat.id)
+        courses = await asyncio.to_thread(_vora_call, tgt, lambda v: v.courses())
+    except Exception as e:
+        await message.reply_text(f"<blockquote><i>❌ <code>{html.escape(str(e))}</code></i></blockquote>")
+        return
+    txt = "<b>📗 Vora batches:</b>\n" + "\n".join(
+        f"<code>{c['id']}</code> — {html.escape(c['name'])}" for c in courses[:80])
+    await message.reply_text(txt[:MAX_TG_MSG_LEN] or "Koi batch nahi mila.")
+
+
+async def _vora_run_many(message, ids, tgt):
+    for cid in ids:
+        if SHUTTING_DOWN["v"]:
+            return
+        bid = f"vora:{cid}"
+        if ACTIVE_JOBS.get(_job_key(tgt, bid, None), {}).get("running"):
+            continue
+        st = await message.reply_text(f"<blockquote><i>🔄 <b>Vora fetching:</b> {cid}\nUpload → <code>{tgt}</code></i></blockquote>")
+        try:
+            await _tracked_batch(message, "", bid, None, tgt, st)
+        except Exception as e:
+            logger.error(f"Vora batch {cid} failed: {e}")
+            await message.reply_text(f"<blockquote><i>❌ Vora batch {cid}: <code>{html.escape(str(e))}</code></i></blockquote>")
+
+
+@app.on_message(filters.command("vbatch") & (filters.group | filters.channel | filters.private))
+async def handle_vbatch(client, message: Message):
+    if message.from_user and not is_user_authorized(message.from_user.id):
+        await message.reply_text("<blockquote><i>🚫 Access Denied.</i></blockquote>")
+        return
+    try:
+        tgt, parts = _target_from((message.text or "").split()[1:], message.chat.id)
+    except Exception:
+        await message.reply_text("<blockquote><i>⚠️ <code>-c</code> ke baad valid channel ID do.</i></blockquote>")
+        return
+    if not parts:
+        await message.reply_text("<blockquote><i>Use: <code>/vbatch &lt;ID&gt;</code> ya <code>/vbatch all</code> [-c channel_id]\nIDs: /vbatches</i></blockquote>")
+        return
+    try:
+        if parts[0].lower() in ("all", "sab", "*"):
+            ids = [c["id"] for c in await asyncio.to_thread(_vora_call, tgt, lambda v: v.courses())]
+        else:
+            ids = [p.strip(",") for p in parts if p.strip(",").isdigit()]
+    except Exception as e:
+        await message.reply_text(f"<blockquote><i>❌ <code>{html.escape(str(e))}</code></i></blockquote>")
+        return
+    if not ids:
+        await message.reply_text("<blockquote><i>⚠️ Batch ID number hona chahiye. /vbatches dekho.</i></blockquote>")
+        return
+    if not get_channel_thumb(tgt):
+        pend = {"event": asyncio.Event(), "file_id": None,
+                "user_id": message.from_user.id if message.from_user else None}
+        PENDING_THUMB[message.chat.id] = pend
+        ask = await message.reply_text(
+            "<blockquote><i>🖼 <b>Custom thumbnail bhejo</b> (photo) ya <code>/skip</code> (90 sec)</i></blockquote>")
+        try:
+            await asyncio.wait_for(pend["event"].wait(), timeout=90)
+        except asyncio.TimeoutError:
+            pass
+        PENDING_THUMB.pop(message.chat.id, None)
+        try:
+            await ask.delete()
+        except Exception:
+            pass
+        if pend["file_id"]:
+            set_channel_thumb(tgt, pend["file_id"])
+    await message.reply_text(f"<blockquote><i>📗 Vora: {len(ids)} batch queue me — ek-ek karke upload honge.</i></blockquote>")
+    asyncio.create_task(_vora_run_many(message, ids, tgt))
+
+
+PANEL_TEXT = ("<b>Courier Well Uploader</b>\n\nPlatform chuno 👇")
+PANEL_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🅰️ Allen", callback_data="Pallen"),
+     InlineKeyboardButton("📗 Vora Classes", callback_data="Pvora")],
+    [InlineKeyboardButton("📚 Library", callback_data="Plib")]])
+_PANEL_HELP = {
+    "allen": ("<b>🅰️ Allen</b>\n\n<code>/login user*pass</code> [-c channel_id]\n<code>/mybatches</code>\n"
+              "<code>/batch &lt;ID&gt; all -c &lt;channel_id&gt;</code>\n<code>/downloadall</code>\n<code>/jobs</code> · <code>/stop</code>"),
+    "vora": ("<b>📗 Vora Classes</b>\n\n<code>/vlogin email:password</code> [-c channel_id]\n<code>/vbatches</code>\n"
+             "<code>/vbatch &lt;ID&gt; -c &lt;channel_id&gt;</code>\n<code>/vbatch all -c &lt;channel_id&gt;</code>\n<code>/jobs</code> · <code>/stop</code>"),
+}
+
+
+@app.on_callback_query(filters.regex(r"^P(allen|vora|lib|back)$"))
+async def handle_panel_cb(client, cq: CallbackQuery):
+    if not is_user_authorized(cq.from_user.id):
+        await cq.answer("Access nahi hai", show_alert=True)
+        return
+    what = cq.data[1:]
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="Pback")]])
+    if what == "back":
+        await cq.message.edit_text(PANEL_TEXT, reply_markup=PANEL_KB)
+    elif what == "lib":
+        text, kb = await lib_batches(cq.from_user.id)
+        await cq.message.edit_text(text, reply_markup=kb)
+    else:
+        await cq.message.edit_text(_PANEL_HELP[what], reply_markup=back)
+    await cq.answer()
 
 
 async def _boot():
