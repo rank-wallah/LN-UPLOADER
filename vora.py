@@ -64,15 +64,27 @@ class Vora:
         self.s.headers.update({"User-ID": str(self.userid), "Authorization": self.token})
 
     def login(self, email, password):
-        _throttle()
-        r = self.s.post(f"{VORA_HOST}/post/userLogin", data={"email": email, "password": password}, timeout=30).json()
-        if r.get("status") != 200:
-            msg = r.get("message") or "Vora login failed"
-            raise (VoraBlocked if _is_block(msg) else RuntimeError)(msg)
-        d = r["data"]
-        self.userid, self.token = d["userid"], d["token"]
-        self._auth()
-        return {"userid": self.userid, "token": self.token, "name": d.get("name", "")}
+        last = ""
+        for attempt in range(4):
+            _throttle()
+            try:
+                resp = self.s.post(f"{VORA_HOST}/post/userLogin", data={"email": email, "password": password}, timeout=30)
+            except requests.RequestException as e:
+                last = str(e); time.sleep(5 * (attempt + 1)); continue
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last = f"Vora server busy ({resp.status_code})"; time.sleep(15 * (attempt + 1)); continue
+            try:
+                r = resp.json()
+            except ValueError:
+                last = f"Vora ne galat jawab diya ({resp.status_code})"; time.sleep(15 * (attempt + 1)); continue
+            if r.get("status") != 200:
+                msg = r.get("message") or "Vora login failed"
+                raise (VoraBlocked if _is_block(msg) else RuntimeError)(msg)
+            d = r["data"]
+            self.userid, self.token = d["userid"], d["token"]
+            self._auth()
+            return {"userid": self.userid, "token": self.token, "name": d.get("name", "")}
+        raise VoraBlocked(f"{last}. Vora abhi block/busy hai, 15 min baad try karo.")
 
     def get(self, path):
         delay = 5
